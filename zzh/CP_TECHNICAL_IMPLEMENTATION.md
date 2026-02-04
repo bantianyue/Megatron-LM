@@ -524,13 +524,17 @@ python pretrain_gpt.py \
 
 #### Python API
 
+##### 示例 1: 基本使用
+
 ```python
+import torch
 from megatron.core.transformer.transformer_config import TransformerConfig
 from megatron.core.extensions.transformer_engine import TEDotProductAttention
 from megatron.core.transformer.enums import AttnMaskType
 from megatron.core import parallel_state
+from megatron.core.packed_seq_params import PackedSeqParams
 
-# 配置
+# 1. 配置
 config = TransformerConfig(
     hidden_size=4096,
     num_attention_heads=32,
@@ -543,7 +547,7 @@ config = TransformerConfig(
     sequence_parallel=True,
 )
 
-# 创建 Attention 层
+# 2. 创建 Attention 层
 attention = TEDotProductAttention(
     config=config,
     layer_number=1,
@@ -551,12 +555,161 @@ attention = TEDotProductAttention(
     cp_comm_type="p2p",
 )
 
-# 获取 CP 信息
+# 3. 获取 CP 信息
 cp_group = parallel_state.get_context_parallel_group()
 cp_size = parallel_state.get_context_parallel_world_size()
 cp_rank = parallel_state.get_context_parallel_rank()
 
 print(f"CP size: {cp_size}, CP rank: {cp_rank}")
+
+# 4. 准备输入数据
+# 输入形状: [seq_len, batch, num_heads, head_dim]
+# 注意：由于 CP 分割序列，每个 rank 的 seq_len = total_seq_len / cp_size
+seq_len_per_rank = 2048  # 总序列 4096 / CP=2
+batch_size = 2
+num_heads = 32
+head_dim = 128
+
+query = torch.randn(seq_len_per_rank, batch_size, num_heads, head_dim, device='cuda')
+key = torch.randn(seq_len_per_rank, batch_size, num_heads, head_dim, device='cuda')
+value = torch.randn(seq_len_per_rank, batch_size, num_heads, head_dim, device='cuda')
+
+# 5. 调用 forward
+context, _ = attention(
+    query=query,
+    key=key,
+    value=value,
+    attention_mask=None,  # 因果掩码由 attn_mask_type 参数处理
+)
+
+# 6. 输出
+# context 形状: [seq_len_per_rank, batch, num_heads, head_dim]
+print(f"Output shape: {context.shape}")
+```
+
+##### 示例 2: 使用 Packed Sequence (变长序列)
+
+```python
+import torch
+from megatron.core.packed_seq_params import PackedSeqParams
+
+# 创建 PackedSeqParams (用于处理变长序列)
+packed_seq_params = PackedSeqParams(
+    cu_seqlens_q=torch.tensor([0, 100, 200], dtype=torch.int32, device='cuda'),
+    cu_seqlens_kv=torch.tensor([0, 100, 200], dtype=torch.int32, device='cuda'),
+    cu_seqlens_q_padded=torch.tensor([0, 128, 256], dtype=torch.int32, device='cuda'),
+    cu_seqlens_kv_padded=torch.tensor([0, 128, 256], dtype=torch.int32, device='cuda'),
+    max_seqlen_q=128,
+    max_seqlen_kv=128,
+    qkv_format='thd',  # THD 格式支持 CP
+)
+
+# 调用 forward (使用 packed sequence)
+context, _ = attention(
+    query=query,
+    key=key,
+    value=value,
+    attention_mask=None,
+    packed_seq_params=packed_seq_params,  # 传入 packed_seq_params
+)
+```
+
+##### 示例 3: 完整的 Transformer Layer 使用
+
+```python
+import torch
+import torch.nn as nn
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_layer import TransformerLayer
+from megatron.core import parallel_state
+
+# 1. 初始化并行环境
+# (通常在训练脚本开始时调用一次)
+# parallel_state.initialize_model_parallel(...)
+
+# 2. 创建配置
+config = TransformerConfig(
+    hidden_size=4096,
+    num_attention_heads=32,
+    num_layers=24,
+    ffn_hidden_size=13696,
+    # CP 配置
+    context_parallel_size=2,
+    tensor_model_parallel_size=4,
+    pipeline_model_parallel_size=1,
+    sequence_parallel=True,
+    # 其他配置
+    add_bias_linear=False,
+    gated_linear_unit=True,
+    activation_func=torch.nn.functional.silu,
+    normalization="RMSNorm",
+)
+
+# 3. 创建 Transformer Layer
+layer = TransformerLayer(
+    config=config,
+    layer_number=1,
+    hidden_dropout=None,
+)
+
+# 4. 准备输入
+# 形状: [seq_len_per_rank, batch, hidden_size]
+hidden_states = torch.randn(2048, 2, 4096, device='cuda')
+
+# 5. 前向传播
+# CP 通信在 layer 内部自动处理
+hidden_states, context = layer(
+    hidden_states=hidden_states,
+    attention_mask=None,
+)
+
+print(f"Output shape: {hidden_states.shape}")
+# 输出: [2048, 2, 4096] (序列长度被 CP 分割)
+```
+
+##### 示例 4: 动态切换 CP 组
+
+```python
+import torch
+from megatron.core.packed_seq_params import PackedSeqParams
+
+# 场景: 编码器不需要 CP，解码器需要 CP
+
+# 1. 关闭 CP (用于编码器)
+packed_seq_params_encoder = PackedSeqParams(
+    cu_seqlens_q=torch.tensor([0, 100], dtype=torch.int32, device='cuda'),
+    cu_seqlens_kv=torch.tensor([0, 100], dtype=torch.int32, device='cuda'),
+    max_seqlen_q=100,
+    max_seqlen_kv=100,
+    qkv_format='thd',
+    local_cp_size=1,  # 设置为 1 表示关闭 CP
+)
+
+context_encoder, _ = attention(
+    query=query,
+    key=key,
+    value=value,
+    packed_seq_params=packed_seq_params_encoder,
+)
+
+# 2. 启用 CP (用于解码器)
+# 使用指定的 CP 组
+cp_group = parallel_state.get_context_parallel_group()
+packed_seq_params_decoder = PackedSeqParams(
+    cu_seqlens_q=torch.tensor([0, 2048], dtype=torch.int32, device='cuda'),
+    cu_seqlens_kv=torch.tensor([0, 2048], dtype=torch.int32, device='cuda'),
+    max_seqlen_q=2048,
+    max_seqlen_kv=2048,
+    qkv_format='thd',
+    cp_group=cp_group,  # 指定 CP 组
+)
+
+context_decoder, _ = attention(
+    query=query,
+    key=key,
+    value=value,
+    packed_seq_params=packed_seq_params_decoder,
+)
 ```
 
 ### 5.2 不同通信类型
