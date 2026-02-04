@@ -167,6 +167,64 @@ hierarchical_context_parallel_sizes = [4, 2]  # 总共 8 个 CP rank
 
 ## 4. 代码实现分析
 
+### 4.0 总体实现概述
+
+Megatron-LM 的 Context Parallelism (CP) 实现基于 **Transformer Engine** 的 Flash Attention，主要通过以下机制实现：
+
+#### 核心实现流程
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│                    CP 实现流程 (Transformer)                    │
+├────────────────────────────────────────────────────────────────┤
+│                                                                │
+│  1. 初始化阶段                                                  │
+│     └── parallel_state.initialize_model_parallel()            │
+│         └── 创建 _CONTEXT_PARALLEL_GROUP 进程组                │
+│                                                                │
+│  2. Attention 层创建                                           │
+│     └── TEDotProductAttention.__init__()                       │
+│         ├── 获取 CP 进程组                                     │
+│         ├── 设置 CP 通信类型 (p2p/a2a/allgather/a2a+p2p)      │
+│         └── 创建 CP 专用 CUDA Stream (通信与计算重叠)          │
+│                                                                │
+│  3. 前向传播                                                    │
+│     └── TEDotProductAttention.forward()                        │
+│         ├── 输入: [seq/cp, batch, heads, head_dim]            │
+│         ├── Ring Attention 通信 (P2P 模式)                     │
+│         │   ├── Round 0: 计算本地 attention                    │
+│         │   ├── Round 1: 发送 KV 给邻居，接收邻居 KV           │
+│         │   └── 重复 CP_size 次                                │
+│         └── 输出: [seq/cp, batch, heads, head_dim]            │
+│                                                                │
+│  4. 后处理                                                      │
+│     └── Output Projection + AllGather (如需要)                 │
+│                                                                │
+└────────────────────────────────────────────────────────────────┘
+```
+
+#### 关键技术点
+
+| 技术点 | 说明 | 代码位置 |
+|--------|------|---------|
+| **进程组管理** | 创建和管理 CP 进程组 | `parallel_state.py:972-999` |
+| **Ring Attention** | P2P 模式的环形通信 | Transformer Engine 内部实现 |
+| **CP Stream** | 专用 CUDA Stream 实现通信计算重叠 | `transformer_engine.py:1232-1238` |
+| **动态 CP 组** | 运行时切换 CP 组 | `transformer_engine.py:1346-1363` |
+| **Load Balancing** | 序列重排序优化 | Transformer Engine 内部实现 |
+
+#### 与 Mamba/Multimodal CP 的区别
+
+| 模型类型 | CP 实现方式 | 通信类型 |
+|---------|-------------|---------|
+| **Transformer** | TEDotProductAttention (TE 内部) | Ring Attention (P2P) |
+| Mamba | MambaContextParallel (自定义) | All-to-All |
+| Multimodal | 辅助工具函数 | 仅 Padding 计算 |
+
+**本文档仅介绍 Transformer 模型的 CP 实现。**
+
+---
+
 ### 4.1 CP 进程组初始化
 
 **文件**: `megatron/core/parallel_state.py:972-999`
@@ -309,203 +367,54 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         )
 ```
 
-### 4.3 Mamba CP 实现
+---
 
-**文件**: `megatron/core/ssm/mamba_context_parallel.py:31-301`
+### 4.3 Transformer Layer 集成
 
-```python
-class MambaContextParallel:
-    """Mamba 模型的 All-to-All Context Parallel 实现"""
+Transformer 层通过 `TransformerBlock` 自动集成 CP 功能：
 
-    def __init__(
-        self,
-        cp_group: torch.distributed.ProcessGroup,
-        d_inner_local_tp: int,
-        nheads_local_tp: int,
-        d_state: int,
-        conv1d_cp1: nn.Conv1d,
-        ...
-    ):
-        self.cp_group = cp_group
-        self.cp_size = cp_group.size()
-
-        # 计算本地 CP 维度
-        self.nheads_local_tpcp = self.nheads_local_tp // self.cp_size
-        self.d_inner_local_tpcp = self.d_inner_local_tp // self.cp_size
-
-    def pre_conv_ssm(
-        self, input_: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
-    ) -> torch.Tensor:
-        """卷积和 SSM 之前的 All-to-All 通信
-
-        将输入从 [seq/cp, batch, hidden] 转换为 [seq, batch, hidden/cp]
-        """
-        if self.cp_size == 1:
-            return input_
-
-        # 分割输入: z, x, B, C, dt
-        z, x, B, C, dt = torch.split(
-            input_,
-            [self.d_inner_local_tp, self.d_inner_local_tp,
-             self.ngroups_local_tp * self.d_state, self.ngroups_local_tp * self.d_state,
-             self.nheads_local_tp],
-            dim=-1,
-        )
-
-        # All-to-All: CP → HP (Hidden Parallel)
-        z = _all_to_all_cp2hp(z, self.cp_group)
-        x = _all_to_all_cp2hp(x, self.cp_group)
-        B = _all_to_all_cp2hp(B, self.cp_group)
-        C = _all_to_all_cp2hp(C, self.cp_group)
-        dt = _all_to_all_cp2hp(dt, self.cp_group)
-
-        # 撤销 attention load balancing
-        output = torch.cat([z, x, B, C, dt], dim=-1)
-        output = _undo_attention_load_balancing(output, self.cp_size, packed_seq_params)
-
-        return output
-
-    def post_conv_ssm(
-        self, input_: torch.Tensor, packed_seq_params: Optional[PackedSeqParams] = None
-    ) -> torch.Tensor:
-        """卷积和 SSM 之后的 All-to-All 通信
-
-        将输入从 [seq, batch, hidden/cp] 转换回 [seq/cp, batch, hidden]
-        """
-        if self.cp_size == 1:
-            return input_
-
-        return _all_to_all_hp2cp(
-            _redo_attention_load_balancing(input_, self.cp_size, packed_seq_params),
-            self.cp_group,
-        )
-
-
-def _all_to_all_cp2hp(
-    input_: torch.Tensor, cp_group: torch.distributed.ProcessGroup
-) -> torch.Tensor:
-    """
-    All-to-All: [seq/cp, batch, hidden] → [seq, batch, hidden/cp]
-
-    步骤:
-    1. reshape: [seq/cp, batch, hidden] → [seq*batch/cp, hidden]
-    2. split: 沿 hidden 维度分割成 cp_size 份
-    3. concat: 沿 seq*batch 维度连接
-    4. all_to_all: 交换数据
-    5. reshape: [seq*batch, hidden/cp] → [seq, batch, hidden/cp]
-    """
-    assert input_.dim() == 3
-    s_in, b_in, h_in = input_.shape
-
-    # reshape: [s, b, h] → [s*b, h]
-    input_ = input_.reshape(-1, h_in)
-
-    # 分割 hidden 维度
-    world_size = cp_group.size()
-    h_out = h_in // world_size
-    split_tensors = torch.split(input_, split_size_or_sections=h_out, dim=1)
-
-    # 连接
-    concat_tensor = torch.cat(split_tensors, dim=0)
-
-    # All-to-All 通信
-    output = all_to_all(cp_group, concat_tensor)
-
-    # 恢复形状
-    output = output.reshape(s_in * world_size, b_in, h_out)
-    return output
-
-
-def _all_to_all_hp2cp(
-    input_: torch.Tensor, cp_group: torch.distributed.ProcessGroup
-) -> torch.Tensor:
-    """
-    All-to-All: [seq, batch, hidden/cp] → [seq/cp, batch, hidden]
-
-    步骤:
-    1. reshape: [seq, batch, hidden/cp] → [seq*batch, hidden/cp]
-    2. all_to_all: 交换数据
-    3. split: 沿 seq*batch 维度分割
-    4. concat: 沿 hidden 维度连接
-    5. reshape: [seq/cp, batch, hidden]
-    """
-    assert input_.dim() == 3
-    s_in, b_in, h_in = input_.shape
-
-    input_ = input_.reshape(-1, h_in)
-
-    # All-to-All 通信
-    input_exchanged = all_to_all(cp_group, input_)
-
-    world_size = cp_group.size()
-    s_out = s_in // world_size
-    split_tensors = torch.split(input_exchanged, split_size_or_sections=s_out * b_in, dim=0)
-
-    output = torch.cat(split_tensors, dim=-1)
-    output = output.reshape(s_out, b_in, h_in * world_size)
-    return output
-```
-
-### 4.4 Load Balancing 机制
-
-**文件**: `megatron/core/ssm/mamba_context_parallel.py:379-454`
+**文件**: `megatron/core/transformer/transformer_block.py`
 
 ```python
-def _undo_attention_load_balancing(
-    input_: torch.Tensor, cp_size: int, packed_seq_params: Optional[PackedSeqParams] = None
-) -> torch.Tensor:
-    """
-    撤销 CP attention load balancing
+class TransformerBlock(MegatronModule):
+    """Transformer Block，包含 Attention 和 MLP"""
 
-    例如 (非 packed), cp_size=3:
-    输入: [0,1][2,3][4,5] (162534 顺序)
-    输出: [0,1,2][3,4,5] (123456 顺序 - 顺序处理)
+    def __init__(self, config: TransformerConfig, ...):
+        # Attention 层（包含 CP 支持）
+        self.self_attention = build_attention(
+            config=config,
+            layer_number=layer_number,
+            attn_mask_type=AttnMaskType.causal,
+        )
+        # 当 config.context_parallel_size > 1 时
+        # 自动使用 TEDotProductAttention
 
-    这是为了让卷积和 SSM 按顺序处理数据。
-    """
-    if packed_seq_params is None:
-        num_chunks_div_2 = cp_size
-        num_chunks = num_chunks_div_2 * 2
-        chunks = torch.chunk(input_, chunks=num_chunks, dim=0)
+        # MLP 层
+        self.mlp = MLP(config=config, ...)
 
-        # 重新排序: [0, 2, 4, ..., 5, 3, 1]
-        order = [2 * i for i in range(num_chunks_div_2)] + [
-            num_chunks - 2 * i - 1 for i in range(num_chunks_div_2)
-        ]
-        reordered_chunks = [chunks[i] for i in order]
-        return torch.cat(reordered_chunks, dim=0)
-    else:
-        # THD 格式的 packed sequence 处理
-        # 使用 Transformer Engine 的 thd_get_partitioned_indices
-        ...
+    def forward(self, hidden_states, attention_mask, ...):
+        # Attention (CP 通信在内部自动处理)
+        residual = hidden_states
+        hidden_states = self.layer_norm1(hidden_states)
+        hidden_states, context = self.self_attention(
+            hidden_states,
+            attention_mask,
+        )
+        hidden_states = residual + hidden_states
 
+        # MLP
+        residual = hidden_states
+        hidden_states = self.layer_norm2(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
 
-def _redo_attention_load_balancing(
-    input_: torch.Tensor, cp_size: int, packed_seq_params: Optional[PackedSeqParams] = None
-) -> torch.Tensor:
-    """
-    重新应用 CP attention load balancing
-
-    例如 (非 packed), cp_size=3:
-    输入: [0,1,2][3,4,5] (123456 顺序)
-    输出: [0,1][2,3][4,5] (162534 顺序 - 高效 attention)
-
-    这是为了让 attention 高效处理。
-    """
-    if packed_seq_params is None:
-        num_chunks_div_2 = cp_size
-        num_chunks = num_chunks_div_2 * 2
-        chunks = torch.chunk(input_, chunks=num_chunks, dim=0)
-
-        order = [None] * num_chunks
-        order[::2] = range(num_chunks_div_2)  # 偶数位置
-        order[1::2] = reversed(range(num_chunks_div_2, num_chunks))  # 奇数位置
-        reordered_chunks = [chunks[i] for i in order]
-        return torch.cat(reordered_chunks, dim=0)
-    else:
-        # THD 格式的 packed sequence 处理
-        ...
+        return hidden_states, context
 ```
+
+**关键点**：
+- CP 通信对用户透明，无需手动调用
+- 只需在 `TransformerConfig` 中设置 `context_parallel_size`
+- Attention 和 MLP 自动适配 CP 模式
 
 ---
 
@@ -719,7 +628,9 @@ context_decoder, _ = attention(
 
 ### 5.2 不同通信类型
 
-#### P2P (Ring Attention)
+#### P2P (Ring Attention) - 推荐
+
+P2P 是 Transformer 模型的默认选择，使用 Ring Attention 机制。
 
 ```bash
 python pretrain_gpt.py \
@@ -728,14 +639,25 @@ python pretrain_gpt.py \
     --seq-length 32768
 ```
 
-#### A2A (All-to-All) - 适用于 Mamba
+**特点：**
+- 低延迟，适合长序列
+- 通信开销均匀分布
+- 适用于大多数 Transformer 模型
+
+#### A2A (All-to-All)
+
+A2A 通信模式，通过 all-to-all 集体通信原语实现。
 
 ```bash
-python pretrain_mamba.py \
+python pretrain_gpt.py \
     --context-parallel-size 4 \
     --cp-comm-type a2a \
     --seq-length 16384
 ```
+
+**特点：**
+- 均衡负载
+- 适用于特定场景
 
 #### 层次化 CP (a2a+p2p)
 
@@ -774,65 +696,45 @@ python pretrain_gpt.py \
     --dataloader-type single
 ```
 
-### 5.5 多模态模型 CP
-
-```python
-from megatron.core.models.multimodal.context_parallel import (
-    get_padding,
-    get_packed_seq_params,
-)
-
-# 计算 padding
-padding_needed = get_padding(
-    seq_len=4096,
-    cp_size=2,
-    tp_size=4,
-    has_sp=True,
-    decoder_tp_comm_overlap=True,
-    decoder_seq_len=8192,
-)
-
-# 获取 packed_seq_params
-packed_seq_params = get_packed_seq_params(
-    tokens=tokens,
-    img_seq_len=576,
-    padding_needed=padding_needed,
-    cp_size=2,
-    use_packed_sequence=False,
-)
-```
-
 ---
 
 ## 6. 性能优化
 
 ### 6.1 序列长度对齐
 
+CP 对序列长度有对齐要求，需要确保序列长度满足 CP 的倍数要求。
+
+**基本规则：**
 ```python
-# megatron/core/models/multimodal/context_parallel.py:18-59
-def get_padding(seq_len, cp_size, tp_size, has_sp, ...):
-    """计算 SP+CP+TP 所需的 padding"""
+# 序列长度必须满足
+seq_length % (2 * context_parallel_size) == 0
 
-    if has_sp and cp_size > 1:
-        # CP + SP: padding 到 tp_size * cp_size * 2 的倍数
-        padding_factor = tp_size * cp_size * 2
-    elif cp_size > 1:
-        # 仅 CP: padding 到 cp_size * 2 的倍数
-        padding_factor = cp_size * 2
-    elif has_sp:
-        # 仅 SP: padding 到 tp_size 的倍数
-        padding_factor = tp_size
-
-    padding = (seq_len + padding_factor - 1) // padding_factor * padding_factor - seq_len
-    return padding
+# 如果同时使用 Sequence Parallel (SP)
+seq_length % (2 * context_parallel_size * tensor_parallel_size) == 0
 ```
 
 **示例：**
 ```python
-seq_len = 5000, cp_size = 2, tp_size = 4, has_sp = True
-padding_factor = 4 * 2 * 2 = 16
-padding = 16 - (5000 % 16) = 16 - 8 = 8
-final_seq_len = 5008
+# 配置: CP=2, TP=4, SP=True
+cp_size = 2
+tp_size = 4
+has_sp = True
+
+# 计算所需 padding
+if has_sp and cp_size > 1:
+    padding_factor = tp_size * cp_size * 2  # 4 * 2 * 2 = 16
+elif cp_size > 1:
+    padding_factor = cp_size * 2  # 2 * 2 = 4
+elif has_sp:
+    padding_factor = tp_size  # 4
+
+# 原始序列长度
+seq_len = 5000
+padding = padding_factor - (seq_len % padding_factor)  # 16 - 8 = 8
+final_seq_len = seq_len + padding  # 5008
+
+# 验证
+assert final_seq_len % padding_factor == 0  # 5008 % 16 == 0 ✓
 ```
 
 ### 6.2 CP 专用 Stream
@@ -877,9 +779,9 @@ TP=2, PP=1, CP=4:
 ### 6.5 最佳实践
 
 1. **选择合适的通信类型**
-   - 超长序列 (>32K): 使用 `p2p`
-   - Mamba 模型: 使用 `a2a`
-   - 大规模 CP (>8): 考虑 `a2a+p2p`
+   - 超长序列 (>32K): 使用 `p2p` (Ring Attention)
+   - 大规模 CP (>8): 考虑 `a2a+p2p` (层次化 CP)
+   - 一般场景: 使用 `p2p` 即可
 
 2. **CP 与其他并行的组合**
    ```
@@ -948,16 +850,55 @@ class ModelParallelConfig:
     hybrid_context_parallel: bool = False
 ```
 
-### 7.3 多模态 CP API
+### 7.3 Attention Layer API
 
 ```python
-# megatron/core/models/multimodal/context_parallel.py
+# megatron/core/extensions/transformer_engine.py
 
-def get_padding(seq_len, cp_size, tp_size, has_sp, ...):
-    """计算 CP 所需的 padding"""
+class TEDotProductAttention(te.pytorch.DotProductAttention):
+    """Transformer Engine DotProductAttention with CP Support"""
 
-def get_packed_seq_params(tokens, img_seq_len, padding_needed, cp_size, ...):
-    """获取 CP 的 PackedSeqParams"""
+    def __init__(
+        self,
+        config: TransformerConfig,
+        layer_number: int,
+        attn_mask_type: AttnMaskType,
+        cp_comm_type: Optional[str] = "p2p",  # CP 通信类型
+        pg_collection: Optional[ProcessGroupCollection] = None,
+    ):
+        ...
+
+    def forward(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,  # 支持 packed sequence
+    ) -> Tuple[Tensor, Tensor]:
+        """前向传播，自动处理 CP 通信"""
+        ...
+```
+
+**使用示例**：
+```python
+from megatron.core.extensions.transformer_engine import TEDotProductAttention
+
+# 创建 CP Attention 层
+attention = TEDotProductAttention(
+    config=config,
+    layer_number=1,
+    attn_mask_type=AttnMaskType.causal,
+    cp_comm_type="p2p",  # Ring Attention
+)
+
+# 调用 forward - CP 通信自动处理
+context, _ = attention(
+    query=query,
+    key=key,
+    value=value,
+    attention_mask=None,
+)
 ```
 
 ---
