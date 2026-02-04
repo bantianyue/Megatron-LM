@@ -7,6 +7,11 @@
 - [4. 代码实现分析](#4-代码实现分析)
 - [5. 使用指南](#5-使用指南)
 - [6. 性能优化](#6-性能优化)
+- [7. API 参考](#7-api-参考)
+- [8. 完整训练示例](#8-完整训练示例)
+- [9. 常见问题](#9-常见问题)
+- [10. 总结](#10-总结)
+- [11. 参考资料](#11-参考资料)
 
 ---
 
@@ -957,7 +962,503 @@ def get_packed_seq_params(tokens, img_seq_len, padding_needed, cp_size, ...):
 
 ---
 
-## 8. 常见问题
+## 8. 完整训练示例
+
+### 8.1 示例 1: 使用 Megatron-LM 预训练脚本
+
+#### 环境准备
+
+```bash
+# 1. 设置环境变量 (必需)
+export CUDA_DEVICE_MAX_CONNECTIONS=1  # CP 必需
+
+# 2. 设置分布式相关
+export MASTER_ADDR=localhost
+export MASTER_PORT=6000
+
+# 3. 配置 NCCL (可选，用于性能优化)
+export NCCL_ALGO=Tree
+export NCCL_PROTO=Simple
+```
+
+#### 启动训练脚本 (torchrun)
+
+```bash
+#!/bin/bash
+# launch_cp_training.sh
+
+# 配置
+GPUS_PER_NODE=8
+NNODES=1
+TP=4
+PP=1
+CP=2
+
+# 训练参数
+MODEL_SIZE="7B"
+SEQ_LEN=8192
+GLOBAL_BATCH=64
+MICRO_BATCH=1
+
+# 启动训练
+torchrun --nproc_per_node=$GPUS_PER_NODE \
+    --nnodes=$NNODES \
+    --master_addr=$MASTER_ADDR \
+    --master_port=$MASTER_PORT \
+    pretrain_gpt.py \
+    --tensor-model-parallel-size $TP \
+    --pipeline-model-parallel-size $PP \
+    --context-parallel-size $CP \
+    --cp-comm-type p2p \
+    --sequence-parallel \
+    --num-layers 32 \
+    --hidden-size 4096 \
+    --num-attention-heads 32 \
+    --ffn-hidden-size 13696 \
+    --seq-length $SEQ_LEN \
+    --max-position-embeddings $SEQ_LEN \
+    --micro-batch-size $MICRO_BATCH \
+    --global-batch-size $GLOBAL_BATCH \
+    --train-iters 500000 \
+    --lr 1.0e-4 \
+    --min-lr 1.0e-5 \
+    --lr-decay-style cosine \
+    --weight-decay 0.1 \
+    --clip-grad 1.0 \
+    --adam-beta1 0.9 \
+    --adam-beta2 0.95 \
+    --init-method-std 0.01 \
+    --bf16 \
+    --save /path/to/checkpoints \
+    --data-path /path/to/data/gpt2_text_document \
+    --vocab-file /path/to/gpt2/vocab.json \
+    --merge-file /path/to/gpt2/merges.txt
+```
+
+#### Slurm 集群启动
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=megatron-cp-training
+#SBATCH --nodes=4
+#SBATCH --ntasks-per-node=8
+#SBATCH --gres=gpu:8
+
+MASTER_ADDR=$(scontrol show hostname $SLURM_JOB_NODELIST | head -n 1)
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+
+srun bash -c "
+    torchrun --nproc_per_node=8 \
+        pretrain_gpt.py \
+        --tensor-model-parallel-size 4 \
+        --context-parallel-size 2 \
+        --cp-comm-type p2p \
+        --sequence-parallel \
+        --seq-length 8192 \
+        --bf16
+"
+```
+
+### 8.2 示例 2: 自定义训练脚本 (MCore API)
+
+```python
+#!/usr/bin/env python3
+"""
+CP Ring Attention 自定义训练示例
+使用 Megatron Core API 构建 GPT 模型
+"""
+
+import os
+import torch
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+from megatron.core import parallel_state, tensor_parallel
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.models.gpt.gpt_model import GPTModel
+from megatron.training import get_args, get_timers
+from megatron.training.initialize import initialize_megatron
+
+
+# ============== 数据集 ==============
+class SimpleTextDataset(Dataset):
+    """简单的文本数据集"""
+
+    def __init__(self, seq_length=8192, num_samples=10000, vocab_size=50257):
+        self.seq_length = seq_length
+        self.num_samples = num_samples
+        self.vocab_size = vocab_size
+
+    def __len__(self):
+        return self.num_samples
+
+    def __getitem__(self, idx):
+        tokens = torch.randint(0, self.vocab_size, (self.seq_length,))
+        labels = tokens.clone()
+        return tokens, labels
+
+
+# ============== 模型配置 ==============
+def get_model_config():
+    """获取模型配置"""
+    args = get_args()
+
+    config = TransformerConfig(
+        # 模型架构
+        num_layers=args.num_layers,
+        hidden_size=args.hidden_size,
+        num_attention_heads=args.num_attention_heads,
+        ffn_hidden_size=args.ffn_hidden_size,
+
+        # CP 配置
+        tensor_model_parallel_size=args.tensor_model_parallel_size,
+        pipeline_model_parallel_size=args.pipeline_model_parallel_size,
+        context_parallel_size=args.context_parallel_size,
+        sequence_parallel=args.sequence_parallel,
+
+        # CP 通信类型
+        cp_comm_type=getattr(args, 'cp_comm_type', 'p2p'),
+
+        # 其他配置
+        add_bias_linear=False,
+        gated_linear_unit=True,
+        activation_func=F.silu,
+        normalization="RMSNorm",
+
+        # 精度
+        bf16=args.bf16,
+        params_dtype=torch.bfloat16,
+    )
+
+    return config
+
+
+# ============== 模型定义 ==============
+def model_provider():
+    """返回模型提供函数"""
+    config = get_model_config()
+
+    model = GPTModel(
+        config=config,
+        transformer_config=config,
+        vocab_size=args.padded_vocab_size,
+        max_sequence_length=args.seq_length,
+        parallel_output=True,
+    )
+
+    return model
+
+
+# ============== 训练循环 ==============
+def train_epoch(model, optimizer, lr_scheduler, dataloader, epoch):
+    """训练一个 epoch"""
+    model.train()
+
+    for step, (tokens, labels) in enumerate(dataloader):
+        tokens = tokens.cuda(non_blocking=True)
+        labels = labels.cuda(non_blocking=True)
+
+        # 前向传播 - CP 通信在模型内部自动处理
+        logits = model(tokens)
+
+        # 仅在 pipeline 最后 stage 计算损失
+        if parallel_state.is_pipeline_last_stage():
+            # Tensor Parallel vocab 分区
+            logits = tensor_parallel.vocab_parallel_with_logits(logits)
+
+            loss = F.cross_entropy(
+                logits.view(-1, logits.size(-1)),
+                labels.view(-1),
+                ignore_index=-1,
+            )
+        else:
+            loss = torch.tensor(0.0, device='cuda')
+
+        # 反向传播
+        optimizer.zero_grad()
+        loss.backward()
+
+        # 梯度裁剪
+        if args.clip_grad > 0.0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad)
+
+        # 更新参数
+        optimizer.step()
+        lr_scheduler.step()
+
+        # 日志
+        if step % args.log_interval == 0 and parallel_state.is_rank_0():
+            lr = optimizer.param_groups[0]['lr']
+            print(f"Epoch {epoch}, Step {step}, Loss: {loss.item():.4f}, LR: {lr:.6f}")
+
+
+# ============== 主函数 ==============
+def main():
+    """主训练函数"""
+    # 初始化 Megatron
+    initialize_megatron(
+        extra_args_provider=None,
+        args_defaults={
+            'micro_batch_size': 1,
+            'global_batch_size': 64,
+            'seq_length': 8192,
+            'num_layers': 32,
+            'hidden_size': 4096,
+            'num_attention_heads': 32,
+            'ffn_hidden_size': 13696,
+            'tensor_model_parallel_size': 4,
+            'pipeline_model_parallel_size': 1,
+            'context_parallel_size': 2,
+            'cp_comm_type': 'p2p',
+            'sequence_parallel': True,
+            'bf16': True,
+            'train_iters': 500000,
+            'lr': 1.0e-4,
+            'weight_decay': 0.1,
+            'clip_grad': 1.0,
+            'log_interval': 1,
+        }
+    )
+
+    global args
+    args = get_args()
+
+    # 打印 CP 配置
+    if parallel_state.is_rank_0():
+        print("=" * 80)
+        print("Context Parallelism Training")
+        print("=" * 80)
+        print(f"TP: {parallel_state.get_tensor_model_parallel_world_size()}")
+        print(f"PP: {parallel_state.get_pipeline_model_parallel_world_size()}")
+        print(f"CP: {parallel_state.get_context_parallel_world_size()}")
+        print(f"CP comm type: {args.cp_comm_type}")
+        print(f"Sequence length: {args.seq_length}")
+        print("=" * 80)
+
+    # 创建模型
+    model = model_provider()
+
+    # 创建优化器
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.lr,
+        betas=(args.adam_beta1, args.adam_beta2),
+        weight_decay=args.weight_decay,
+    )
+
+    # 创建学习率调度器
+    total_steps = args.train_iters
+    warmup_steps = int(total_steps * 0.01)
+
+    def lr_lambda(step):
+        if step < warmup_steps:
+            return step / warmup_steps
+        else:
+            from math import cos, pi
+            progress = (step - warmup_steps) / (total_steps - warmup_steps)
+            return 0.5 * (1.0 + cos(progress * pi))
+
+    lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    # 创建数据集
+    dataset = SimpleTextDataset(
+        seq_length=args.seq_length,
+        num_samples=args.global_batch_size * 1000,
+        vocab_size=args.padded_vocab_size
+    )
+
+    sampler = torch.utils.data.distributed.DistributedSampler(
+        dataset,
+        num_replicas=parallel_state.get_data_parallel_world_size(),
+        rank=parallel_state.get_data_parallel_rank(),
+        shuffle=True,
+    )
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.micro_batch_size,
+        sampler=sampler,
+        num_workers=4,
+        pin_memory=True,
+    )
+
+    # 训练循环
+    total_epochs = 10
+
+    for epoch in range(total_epochs):
+        if parallel_state.is_rank_0():
+            print(f"\n{'='*80}\nEpoch {epoch + 1}/{total_epochs}\n{'='*80}\n")
+
+        train_epoch(model, optimizer, lr_scheduler, dataloader, epoch)
+
+        # 保存 checkpoint
+        if parallel_state.is_rank_0():
+            checkpoint_path = f"./checkpoints/cp_model_epoch_{epoch}.pt"
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+            }, checkpoint_path)
+            print(f"Checkpoint saved: {checkpoint_path}")
+
+    if parallel_state.is_rank_0():
+        print("\nTraining completed!")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+#### 启动自定义训练
+
+```bash
+#!/bin/bash
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+
+torchrun --nproc_per_node=8 \
+    custom_cp_training.py \
+    --tensor-model-parallel-size 4 \
+    --context-parallel-size 2 \
+    --cp-comm-type p2p \
+    --sequence-parallel \
+    --seq-length 8192
+```
+
+### 8.3 示例 3: 最小化 CP 演示
+
+```python
+#!/usr/bin/env python3
+"""
+最小化 CP Ring Attention 演示
+"""
+import os
+os.environ.setdefault("CUDA_DEVICE_MAX_CONNECTIONS", "1")
+
+import torch
+from megatron.core import parallel_state
+from megatron.core.transformer.transformer_config import TransformerConfig
+from megatron.core.transformer.transformer_block import TransformerBlock
+
+
+def demo_cp_attention():
+    """演示 CP Attention 的基本使用"""
+
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    device = torch.device(f'cuda:{rank}')
+
+    # 配置: TP=2, CP=4 (假设 8 GPUs)
+    config = TransformerConfig(
+        num_layers=2,
+        hidden_size=512,
+        num_attention_heads=8,
+        ffn_hidden_size=2048,
+
+        # CP 配置
+        tensor_model_parallel_size=2,
+        context_parallel_size=4,
+        sequence_parallel=True,
+        cp_comm_type='p2p',
+
+        # 精度
+        bf16=True,
+    )
+
+    # 创建 Transformer Block
+    transformer_block = TransformerBlock(
+        config=config,
+        pre_process=True,
+        post_process=True,
+    ).to(device)
+
+    print(f"Rank {rank}: TP={parallel_state.get_tensor_model_parallel_world_size()}, "
+          f"CP={parallel_state.get_context_parallel_world_size()}")
+
+    # 准备输入: 由于 CP=4，序列被分割
+    seq_len_per_rank = 128  # 总序列 512 / 4
+    batch_size = 2
+    hidden_size = 512
+
+    hidden_states = torch.randn(
+        seq_len_per_rank, batch_size, hidden_size,
+        dtype=torch.bfloat16, device=device,
+    )
+
+    print(f"Rank {rank}: Input shape: {hidden_states.shape}")
+
+    # 前向传播 - CP 通信自动处理
+    with torch.no_grad():
+        output, context = transformer_block(
+            hidden_states=hidden_states,
+            attention_mask=None,
+        )
+
+    print(f"Rank {rank}: Output shape: {output.shape}")
+    print(f"Rank {rank}: Demo completed!")
+
+
+if __name__ == "__main__":
+    demo_cp_attention()
+```
+
+### 8.4 验证 CP 配置
+
+```python
+# check_cp_config.py
+from megatron.core import parallel_state
+
+def print_cp_config():
+    """打印 CP 配置"""
+    tp = parallel_state.get_tensor_model_parallel_world_size()
+    pp = parallel_state.get_pipeline_model_parallel_world_size()
+    cp = parallel_state.get_context_parallel_world_size()
+    dp = parallel_state.get_data_parallel_world_size()
+
+    tp_rank = parallel_state.get_tensor_model_parallel_rank()
+    pp_rank = parallel_state.get_pipeline_model_parallel_rank()
+    cp_rank = parallel_state.get_context_parallel_rank()
+
+    print("=" * 60)
+    print("Megatron Parallel Configuration")
+    print("=" * 60)
+    print(f"TP: {tp} (rank: {tp_rank})")
+    print(f"PP: {pp} (rank: {pp_rank})")
+    print(f"CP: {cp} (rank: {cp_rank})")
+    print(f"DP: {dp}")
+    print("=" * 60)
+    print(f"Total GPUs: {tp * pp * cp * dp}")
+
+    if cp > 1:
+        cp_ranks = parallel_state.get_context_parallel_global_ranks()
+        print(f"CP group ranks: {cp_ranks}")
+
+if __name__ == "__main__":
+    from megatron import initialize_megatron
+    initialize_megatron()
+    print_cp_config()
+```
+
+### 8.5 常见问题解决
+
+#### NCCL 超时
+```bash
+export NCCL_BLOCKING_WAIT=1
+export NCCL_TIMEOUT=3600
+```
+
+#### 内存不足
+```bash
+--micro-batch-size 1
+--recompute-activations
+```
+
+#### 序列长度不匹配
+```python
+assert seq_length % (2 * context_parallel_size) == 0
+```
+
+---
+
+## 9. 常见问题
 
 ### Q1: CP 和 Sequence Parallel (SP) 的区别？
 
@@ -1002,7 +1503,7 @@ python -c "from megatron.core import parallel_state; \
 
 ---
 
-## 9. 总结
+## 10. 总结
 
 Context Parallelism 是 Megatron-LM 中处理超长序列的关键技术：
 
@@ -1021,7 +1522,7 @@ Context Parallelism 是 Megatron-LM 中处理超长序列的关键技术：
 
 ---
 
-## 参考资料
+## 11. 参考资料
 
 1. Ring Attention Paper: https://arxiv.org/abs/2310.01889
 2. Megatron-LM GitHub: https://github.com/NVIDIA/Megatron-LM
