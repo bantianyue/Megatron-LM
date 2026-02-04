@@ -439,6 +439,93 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
         )
 ```
 
+#### Transformer Engine 库的作用
+
+**什么是 Transformer Engine？**
+
+Transformer Engine (TE) 是 NVIDIA 开发的独立库，提供高度优化的 Transformer 组件。
+
+```
+Megatron                    Transformer Engine 库
+    │                               │
+    ├── 配置层                      │
+    │   ├── context_parallel_size   │
+    │   ├── cp_comm_type             │
+    │   └── cp_stream                │
+    │                               │
+    └── TEDotProductAttention        │
+        (继承 TE)                    │
+        └── extends ────────────────→  te.pytorch.DotProductAttention
+                                    │
+                                    ▼
+                            ┌──────────────────────┐
+                            │ Flash Attention      │
+                            │ Ring Attention (CP)   │
+                            │ FP8 混合精度          │
+                            │ CUDA Kernels         │
+                            └──────────────────────┘
+```
+
+**TE 提供的核心功能**：
+
+| 功能 | 说明 | 实现位置 |
+|------|------|---------|
+| **Flash Attention** | 高效 Attention 计算，减少内存访问 | TE 内部 (C++/CUDA) |
+| **Ring Attention** | P2P 环形通信，支持超长序列 | TE 内部 (C++/CUDA) |
+| **FP8 训练** | 自动量化的 FP8 混合精度训练 | TE 内部 (C++/CUDA) |
+| **Fused Kernels** | 融合的 Linear、LayerNorm 等 | TE 内部 (C++/CUDA) |
+
+**Megatron 如何调用 TE 的 CP 功能？**
+
+```python
+# megatron/core/extensions/transformer_engine.py
+
+# 1. 导入 Transformer Engine
+import transformer_engine as te
+
+# 2. 创建包装类，继承 TE 的 DotProductAttention
+class TEDotProductAttention(te.pytorch.DotProductAttention):
+    def __init__(self, config, cp_comm_type, ...):
+        # 准备 CP 相关参数
+        extra_kwargs = {}
+
+        if config.context_parallel_size > 1:
+            # 关键参数：告诉 TE 使用 CP
+            extra_kwargs["cp_global_ranks"] = torch.distributed.get_process_group_ranks(
+                pg_collection.cp
+            )
+            extra_kwargs["cp_stream"] = TEDotProductAttention.cp_stream
+            extra_kwargs["cp_comm_type"] = cp_comm_type  # "p2p" / "a2a" / "allgather" / "a2a+p2p"
+
+        # 3. 调用父类（TE）的 __init__
+        super().__init__(
+            num_attention_heads=config.num_attention_heads,
+            attn_mask_type=attn_mask_type.value,
+            tp_group=pg_collection.tp,
+            **extra_kwargs,  # 传递 CP 参数给 TE
+        )
+```
+
+**关键调用点**：
+
+1. **`super().__init__()`**: 调用 TE 的 `DotProductAttention.__init__()`
+   - 传递 `cp_comm_type` 参数告诉 TE 使用哪种 CP 通信模式
+   - 传递 `cp_global_ranks` 告诉 TE CP 组内所有 rank
+   - 传递 `cp_stream` 用于通信计算重叠
+
+2. **`super().forward()`**: 调用 TE 的 `DotProductAttention.forward()`
+   - TE 内部根据 `cp_comm_type` 执行相应的 Ring Attention 通信
+   - 所有 CP 通信（P2P/A2A）都在 TE 的 CUDA kernels 中实现
+
+**总结**：
+
+| 组件 | 作用 | 实现语言 |
+|------|------|---------|
+| **Megatron** | 配置 CP 参数、管理进程组 | Python |
+| **Transformer Engine** | 实现 Ring Attention、优化 kernels | C++/CUDA |
+
+Megatron 的 `transformer_engine.py` 是一个**包装层**，它将 Megatron 的配置转换为 Transformer Engine 的参数，实际的 CP 计算由 TE 的 CUDA kernels 完成。
+
 ---
 
 ### 4.3 Transformer Layer 集成
