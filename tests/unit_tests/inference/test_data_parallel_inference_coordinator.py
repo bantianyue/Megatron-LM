@@ -2,16 +2,38 @@
 
 import asyncio
 import itertools
+import logging
+import multiprocessing
+import os
 import time
+import unittest.mock
 from collections import deque
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import msgpack
+import numpy as np
 import pytest
 import torch
-from tqdm import tqdm
 
-from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, RequestEntry
+from megatron.core.inference.config import PrefixCachingCoordinatorPolicy
+from megatron.core.inference.data_parallel_inference_coordinator import (
+    DataParallelInferenceCoordinator,
+)
+from megatron.core.inference.data_parallel_inference_coordinator.handlers import (
+    HANDLERS,
+    handle_engine_reply,
+)
+from megatron.core.inference.disaggregation.handoff_ownership import (
+    HandoffClaimStatus,
+    HandoffOwnership,
+)
+from megatron.core.inference.engines.async_zmq_communicator import AsyncZMQCommunicator
+from megatron.core.inference.engines.dynamic_engine import (
+    DynamicInferenceEngine,
+    EngineState,
+    RequestEntry,
+    _engine_reply_frames,
+)
 from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_client import InferenceClient
 from megatron.core.inference.inference_request import (
@@ -19,6 +41,7 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceRequestRecord,
     Status,
 )
+from megatron.core.inference.routing import select_engine
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.utils import get_asyncio_loop
@@ -34,7 +57,267 @@ except ImportError:
 NUM_REQUESTS = 10
 NUM_TOKENS = 2
 DEFAULT_PORT = 46581
-ZMQ_FLAKY_SHUTDOWN = True
+
+
+def test_unclaimed_offer_expiry_fences_claims_but_not_live_readers(monkeypatch):
+    clock = unittest.mock.Mock(return_value=10.0)
+    monkeypatch.setattr(
+        "megatron.core.inference.disaggregation.handoff_ownership.time.monotonic", clock
+    )
+    ownership = HandoffOwnership(offer_timeout=5)
+    ownership.offer(1, b"prefill", require_claim=True)
+    ownership.offer(2, b"prefill", require_claim=True)
+    ownership.offer(3, b"unfenced-source")
+    assert ownership.claim(2, "decode") is HandoffClaimStatus.ACCEPTED
+    clock.return_value = 15.0
+    assert ownership.claim(1, "late") is HandoffClaimStatus.EXPIRED
+    assert ownership.expired_unclaimed() == [(1, b"prefill")]
+    assert ownership.expired_unclaimed() == [(1, b"prefill")]  # failed send must retry
+    ownership.release(1)
+    assert ownership.claim(1, "late") is HandoffClaimStatus.EXPIRED
+    assert ownership.claim(2, "other") is HandoffClaimStatus.REJECTED
+    assert ownership.claim(99, "unknown") is HandoffClaimStatus.REJECTED
+    assert not ownership.expired_unclaimed()
+    assert ownership.confirm_terminated("decode") == [(2, b"prefill")]
+    assert ownership.source_engine(3) == b"unfenced-source"
+    ownership.confirm_terminated("late")
+    assert ownership.claim(1, "late") is HandoffClaimStatus.REJECTED
+    ownership.offer(1, b"prefill", require_claim=True)
+    assert ownership.source_engine(1) is None
+    ownership._max_expired_offers = 1
+    ownership.offer(4, b"prefill", require_claim=True)
+    clock.return_value = 20.0
+    ownership.release(4)
+    assert ownership.claim(4, "new") is HandoffClaimStatus.EXPIRED
+    assert ownership.claim(1, "new") is HandoffClaimStatus.REJECTED
+
+
+def test_disconnected_client_does_not_interrupt_reply_bookkeeping():
+    from tests.unit_tests.inference.coordinator_test_utils import make_coordinator_direct
+
+    coord = make_coordinator_direct()
+    coord.known_clients = {b"client"}
+    coord.router_socket = unittest.mock.Mock()
+    coord.router_socket.send_multipart.side_effect = zmq.ZMQError(zmq.EHOSTUNREACH)
+    coord.request_id_to_client_id = {7: b"client"}
+    coord.request_id_to_client_request_id = {7: 70}
+    coord.client_request_to_request_id = {(b"client", 70): 7}
+    coord.request_id_to_rank = {7: b"rank_0"}
+    coord._pending_counts[0] = 1
+    coord.disaggregated_runtime = None
+    HANDLERS[Headers.REQUEST_ERROR](
+        coord, b"rank_0", [Headers.REQUEST_ERROR.value, 7, "failed", True], []
+    )
+    assert not coord.known_clients
+    assert not coord.request_id_to_client_id
+    assert coord._pending_counts[0] == 0
+    coord.router_socket.send_multipart.side_effect = zmq.ZMQError(zmq.EINVAL)
+    with pytest.raises(zmq.ZMQError):
+        coord._send_to_client([b"client", b"payload"])
+
+
+def test_coordinator_registers_client_kv_handoff_handlers():
+    assert Headers.SUBMIT_REQUEST_WITH_KV in HANDLERS
+    assert Headers.RELEASE_KV in HANDLERS
+
+
+def test_invalid_role_registration_replies_without_raising():
+    coordinator = unittest.mock.MagicMock()
+    coordinator.disaggregated_runtime = None
+    coordinator.is_disaggregated_inference.return_value = False
+
+    HANDLERS[Headers.REGISTER_ROLE](
+        coordinator, b"engine", [Headers.REGISTER_ROLE.value, "prefill", "nixl", []], []
+    )
+
+    reply = msgpack.unpackb(
+        coordinator.router_socket.send_multipart.call_args.args[0][1], raw=False
+    )
+    assert Headers(reply[0]) == Headers.REQUEST_ERROR
+
+
+def test_native_disaggregation_rejects_multimodal_without_stopping_coordinator():
+    coordinator = unittest.mock.MagicMock(
+        known_clients={b"client"},
+        enable_prefix_caching=False,
+        next_request_id=0,
+        request_id_to_client_id={},
+        request_id_to_client_request_id={},
+        client_request_to_request_id={},
+    )
+
+    coordinator.is_disaggregated_inference.return_value = True
+    coordinator._send_to_client = DataParallelInferenceCoordinator._send_to_client.__get__(
+        coordinator
+    )
+    coordinator._handlers = HANDLERS
+    submissions = [
+        [
+            b"client",
+            msgpack.packb([Headers.SUBMIT_REQUEST.value, request_id, {}, None]),
+            msgpack.packb([1]),
+            msgpack.packb(None),
+            msgpack.packb(media),
+            msgpack.packb(None),
+        ]
+        for request_id, media in [(7, {"image": [b"image"]}), (8, None)]
+    ]
+    coordinator.router_socket.recv_multipart.side_effect = [
+        *submissions,
+        [b"client", msgpack.packb([Headers.SHUTDOWN.value])],
+    ]
+
+    DataParallelInferenceCoordinator.start(coordinator)
+
+    coordinator.disaggregated_runtime.route_submit.assert_called_once_with(
+        0, msgpack.packb([1]), {}, [], msgpack.packb(None)
+    )
+    assert coordinator.next_request_id == 1
+    assert coordinator.client_request_to_request_id == {(b"client", 8): 0}
+    destination, payload = coordinator.router_socket.send_multipart.call_args.args[0]
+    assert destination == b"client"
+    assert msgpack.unpackb(payload, raw=False) == [
+        Headers.REQUEST_ERROR.value,
+        7,
+        "native disaggregation does not support multimodal requests",
+        True,
+    ]
+
+
+class _StubCoordinator:
+    """Minimal stand-in exposing only what the submit handlers touch."""
+
+    is_disaggregated_inference = DataParallelInferenceCoordinator.is_disaggregated_inference
+    _send_to_client = DataParallelInferenceCoordinator._send_to_client
+
+    def __init__(self, identity=b"engine-0"):
+        self.disaggregated_runtime = None
+        self.known_clients = {b"client-0"}
+        self.next_request_id = 100
+        self.request_id_to_client_id = {}
+        self.request_id_to_client_request_id = {}
+        self.client_request_to_request_id = {}
+        self.request_id_to_rank = {}
+        self.identities_of_data_parallel_ranks = [identity]
+        self.identity_to_rank_index = {identity: 0}
+        self._pending_counts = np.zeros(1, dtype=np.int64)
+        self._identity = identity
+        self.sent = []
+
+    def get_least_loaded_data_parallel_rank(self):
+        return self._identity
+
+    def _send_to_engine(self, identity, frames):
+        # Mirrors the real signature: a list of frames, metadata first. Passing
+        # raw bytes here would splay one frame per byte, so assert the shape.
+        assert isinstance(frames, list), f"expected a frame list, got {type(frames).__name__}"
+        self.sent.append((identity, frames))
+        return True
+
+
+@pytest.mark.parametrize("native_disaggregation", [False, True])
+def test_kv_handoff_round_trip_keeps_prompt_in_its_own_frame(native_disaggregation):
+    """Client -> coordinator -> engine for a KV handoff, asserting the framing.
+
+    The prompt must never be decoded by the coordinator: it is forwarded as the
+    opaque body frame the client packed, byte for byte. Native coordinators
+    reject external handoffs before routing or allocating request state.
+    """
+    prompt_tokens = [11, 22, 33, 44]
+    kv_meta = {"agent": "nixl-0"}
+    src_block_ids = [7, 8]
+
+    # --- client side: build the frames without needing a live socket ---
+    client = InferenceClient.__new__(InferenceClient)
+    client.next_request_id = 5
+    request_id, frames = InferenceClient._make_kv_handoff_request(
+        client, prompt_tokens, SamplingParams(num_tokens_to_generate=4), kv_meta, src_block_ids
+    )
+    assert request_id == 5
+    assert len(frames) == 3, "KV handoff must be framed as [metadata, prompt, src_block_ids]"
+
+    metadata = msgpack.unpackb(frames[0], raw=False)
+    assert metadata[0] == Headers.SUBMIT_REQUEST_WITH_KV.value
+    assert len(metadata) == 4, "only constant-size fields belong in the metadata frame"
+    assert metadata[1] == request_id
+    assert metadata[3] == kv_meta
+    assert msgpack.unpackb(frames[1], raw=False) == prompt_tokens
+    assert msgpack.unpackb(frames[2], raw=False) == src_block_ids
+
+    # --- coordinator side: route it ---
+    coordinator = _StubCoordinator()
+    if native_disaggregation:
+        coordinator.disaggregated_runtime = object()
+        coordinator.router_socket = unittest.mock.Mock()
+    handler = HANDLERS[Headers.SUBMIT_REQUEST_WITH_KV]
+    assert handler(coordinator, b"client-0", metadata, frames[1:]) is None
+
+    if native_disaggregation:
+        assert coordinator.sent == []
+        assert coordinator.next_request_id == 100
+        assert not coordinator.request_id_to_client_id
+        assert not coordinator.request_id_to_client_request_id
+        assert not coordinator.client_request_to_request_id
+        assert not coordinator.request_id_to_rank
+        assert coordinator._pending_counts[0] == 0
+        coordinator.router_socket.send_multipart.assert_called_once()
+        destination, error_frame = coordinator.router_socket.send_multipart.call_args.args[0]
+        header, rejected_id, reason, source_safe = msgpack.unpackb(error_frame, raw=False)
+        assert destination == b"client-0"
+        assert header == Headers.REQUEST_ERROR.value and rejected_id == request_id
+        assert "Client-supplied KV handoffs" in reason
+        assert "native coordinator" in reason and "use SUBMIT_REQUEST" in reason
+        assert source_safe is True
+        return
+
+    assert len(coordinator.sent) == 1
+    identity, out_frames = coordinator.sent[0]
+    assert identity == b"engine-0"
+    assert len(out_frames) == 3
+    # Both body frames are forwarded untouched -- not re-packed.
+    assert out_frames[1] is frames[1]
+    assert out_frames[2] is frames[2]
+
+    engine_metadata = msgpack.unpackb(out_frames[0], raw=False)
+    assert engine_metadata[0] == Headers.SUBMIT_REQUEST_WITH_KV.value
+    server_request_id = engine_metadata[1]
+    assert coordinator.request_id_to_client_request_id[server_request_id] == request_id
+    assert coordinator.request_id_to_rank[server_request_id] == b"engine-0"
+    assert coordinator._pending_counts[0] == 1
+
+    # --- engine side: the bodies are decoded here, for the first time ---
+    assert msgpack.unpackb(out_frames[1], raw=False) == prompt_tokens
+    assert msgpack.unpackb(out_frames[2], raw=False) == src_block_ids
+
+
+def test_kv_handoff_metadata_frame_does_not_grow_with_sequence_length():
+    """The metadata frame is the only one the coordinator decodes, so its size
+    must not follow the prompt. Build the same request at two prompt lengths and
+    require the metadata frame to be byte-identical in length."""
+    client = InferenceClient.__new__(InferenceClient)
+    sizes = []
+    for n_blocks in (1, 64):
+        client.next_request_id = 5
+        _, frames = InferenceClient._make_kv_handoff_request(
+            client,
+            list(range(n_blocks * 64)),
+            SamplingParams(num_tokens_to_generate=4),
+            {"agent": "nixl-0"},
+            list(range(n_blocks)),
+        )
+        sizes.append(len(frames[0]))
+    assert sizes[0] == sizes[1], (
+        f"metadata frame grew with prompt length ({sizes[0]} -> {sizes[1]} bytes); "
+        "something sequence-dependent leaked into it"
+    )
+
+
+def test_kv_handoff_rejects_legacy_single_frame_payload():
+    """A pre-split single-frame payload must be rejected, not silently mis-read."""
+    coordinator = _StubCoordinator()
+    legacy = [Headers.SUBMIT_REQUEST_WITH_KV.value, 1, [1, 2], {}, {}, []]
+    HANDLERS[Headers.SUBMIT_REQUEST_WITH_KV](coordinator, b"client-0", legacy, [])
+    assert coordinator.sent == []
 
 
 class DummyTokenizer:
@@ -45,6 +328,7 @@ class DummyTokenizer:
         self.bos = bos
         self.eod = eod
         self.pad = pad
+        self.detokenize_calls = []
 
     def tokenize(self, prompt):
         if isinstance(prompt, str):
@@ -54,6 +338,7 @@ class DummyTokenizer:
     def detokenize(self, tokens, skip_special_tokens: bool = False):
         if isinstance(tokens, torch.Tensor):
             tokens = tokens.tolist()
+        self.detokenize_calls.append(list(tokens))
         if skip_special_tokens and self.eod in tokens:
             tokens = [tok for tok in tokens if tok != self.eod]
         return " ".join(str(tok) for tok in tokens)
@@ -64,6 +349,11 @@ class DummyContext:
 
     def __init__(self):
         self.active_cnt = 0
+        self.step_count = 0
+        self.block_size_tokens = 64
+        self.enable_prefix_caching = False
+        self.prefix_caching_coordinator_policy = None
+        self.prefix_cache_lru_clock = 0
 
     def get_active_request_count(self) -> int:
         return self.active_cnt
@@ -85,30 +375,70 @@ class DummyEngine(DynamicInferenceEngine):
     def __init__(self):
         """We cannot call super().__init__() because it requires complex setup."""
         self.waiting_request_ids = deque()
+        self.failed_request_ids: List[int] = []
         self.requests: Dict[int, RequestEntry] = {}
-        self.suspend_signal = False
-        self.is_suspended = False
         self._loop = get_asyncio_loop()
         self.context = DummyContext()
         self.controller = DummyController()
-        self.running = asyncio.Event()
-        self.paused = asyncio.Event()
-        self.stopped = asyncio.Event()
+        self._disagg_config = None
+        self._kv_transfer_role = None
         self.pending_microbatch = deque()
-        self.received_pause: bool = False
-        self.received_stop: bool = False
         self.pg_collection = ProcessGroupCollection.use_mpu_process_groups()
         self.rank = torch.distributed.get_rank()
 
+        # State machine (mirrors dynamic_engine.py reset()).
+        self.state = EngineState.RUNNING
+        self._state_events = {k: asyncio.Event() for k in self._STATE_EVENTS}
+        self._state_events[EngineState.RUNNING].set()
+        self._pending_signals = deque()
+        self.resume_request_ids = None
+        self.use_coordinator = False
+
+        self.ep_world_size = 1
+        self.ep_consensus_interval = 1  # TODO: add tests for interval > 1 (e.g. verify pausing is delayed by at most N steps)
+
+        self.step_start_event = unittest.mock.MagicMock()
+        self.step_end_event = unittest.mock.MagicMock()
+
+        # ZMQ-based world barrier (async-friendly, no NCCL).
+        self.zmq_context = zmq.Context()
+        total_world_size = torch.distributed.get_world_size()
+        self.world_zmq_communicator = AsyncZMQCommunicator(self.zmq_context, process_group=None)
+        self.use_synchronous_zmq_collectives = False
+
+    async def run_engine_with_coordinator(self, *, loop=None):
+        """Override to bypass @trace_async_exceptions for testability.
+
+        In production, @trace_async_exceptions converts AssertionError to sys.exit(1) -> SystemExit.
+        In Python 3.12+, asyncio re-raises SystemExit from tasks in the main thread.
+        For tests, we let AssertionErrors propagate directly so pytest.raises can catch them.
+        """
+        return await DynamicInferenceEngine.run_engine_with_coordinator.__wrapped__(self, loop=loop)
+
+    def suspend(self):
+        pass
+
+    def resume(self):
+        pass
+
     def add_request(
-        self, request_id: int, prompt: str, sampling_params: Optional[SamplingParams] = None
-    ) -> asyncio.Future[DynamicInferenceRequestRecord]:
+        self,
+        request_id: int,
+        prompt: str,
+        sampling_params: Optional[SamplingParams] = None,
+        offload_params=None,
+    ) -> asyncio.Future[DynamicInferenceRequest]:
         """Dummy add_request."""
 
+        # Mock tokenization to prevent `prompt_tokens == None`.
+        prompt_tokens = (
+            torch.arange(len(prompt.split())) if isinstance(prompt, str) else torch.tensor(prompt)
+        )
         self.requests[request_id] = RequestEntry(
             record=DynamicInferenceRequestRecord.from_request(
                 DynamicInferenceRequest(
                     prompt=prompt,
+                    prompt_tokens=prompt_tokens,
                     request_id=request_id,
                     sampling_params=sampling_params,
                     status=Status.WAITING_IN_QUEUE,
@@ -122,8 +452,10 @@ class DummyEngine(DynamicInferenceEngine):
 
     async def async_step(self, *, verbose: Optional[bool] = False) -> Dict:
         """Dummy async_step."""
+        await asyncio.sleep(0)
+
         # Finish "active" requests.
-        finished_request_records = []
+        finished_requests = []
         to_remove = []
         for request_id, entry in self.requests.items():
             request = entry.record[-1]
@@ -133,15 +465,14 @@ class DummyEngine(DynamicInferenceEngine):
                     continue
                 request.status = Status.COMPLETED
                 self.context.active_cnt -= 1
-                finished_request_records.append(entry.record)
-                entry.future.set_result(entry.record)
+                finished_request = self._complete_request(entry)
+                finished_requests.append(finished_request)
                 to_remove.append(request_id)
-                # Send signal to coordinator.
+                # Send signal to coordinator, framed the way a real engine does.
                 if self.is_mp_coordinator:
-                    payload = msgpack.packb(
-                        [Headers.ENGINE_REPLY.value, [entry.record.serialize()]], use_bin_type=True
+                    self.socket_for_receiving_requests.send_multipart(
+                        _engine_reply_frames([finished_request.serialize()])
                     )
-                    self.socket_for_receiving_requests.send(payload)
 
         for request_id in to_remove:
             del self.requests[request_id]
@@ -157,10 +488,46 @@ class DummyEngine(DynamicInferenceEngine):
 
         return {
             "active_request_ids": active_request_ids,
-            "finished_request_records": finished_request_records,
+            "finished_requests": finished_requests,
             "step_time": 0.01,
             "cuda_graph_request_count": 1,
         }
+
+
+async def cleanup_engine(engine, client=None, timeout=30.0):
+    """Disconnect an engine between tests. The coordinator stays alive."""
+    task = getattr(engine, 'engine_loop_task', None)
+    if task is not None and not task.done():
+        if client is not None:
+            client.pause_engines()
+        try:
+            await asyncio.wait_for(engine.wait_until(EngineState.PAUSED), timeout=timeout)
+        except (asyncio.TimeoutError, Exception):
+            pass
+
+        if client is not None:
+            client.stop_engines()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+            # Graceful stop failed — fall back to forcible cleanup.
+            for attr in ('expert_parallel_zmq_communicator', 'world_zmq_communicator'):
+                comm = getattr(engine, attr, None)
+                if comm is not None:
+                    comm.close()
+
+            for socket in getattr(engine, 'zmq_sockets', []):
+                if not socket.closed:
+                    socket.close(linger=0)
+
+            task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                pass
+
+    if client is not None:
+        client.stop()
 
 
 @pytest.fixture
@@ -179,12 +546,87 @@ def initialize_model_parallel(request, monkeypatch):
         pipeline_model_parallel_size=pp,
         expert_model_parallel_size=ep,
     )
-    dp = world_size // (tp * pp * ep)
+    dp = world_size // (tp * pp)
     yield world_size, dp, tp, pp, ep
     Utils.destroy_model_parallel()
 
 
-@pytest.mark.skipif(ZMQ_FLAKY_SHUTDOWN, reason="ZMQ shutdown is flaky")
+@pytest.fixture
+def test_case_communicator():
+    """A separate ZMQ communicator for test sync barriers.
+
+    Use this instead of engine._world_barrier() when the engine loop may be
+    calling _world_barrier() concurrently (e.g. during state transitions).
+    """
+    ctx = zmq.Context()
+    comm = AsyncZMQCommunicator(ctx, process_group=None)
+    yield comm
+    comm.close()
+    ctx.term()
+
+
+@pytest.fixture(scope="class")
+def coordinator():
+    """Launch a single coordinator process for the entire test class.
+
+    Only rank 0 spawns the coordinator process.  Non-rank-0 processes use a
+    placeholder address; the real address is broadcast inside each test's call
+    to start_listening_to_data_parallel_coordinator (which broadcasts dp_addr
+    from dp_src within the DP process group).
+
+    The coordinator is spawned with data_parallel_size=0 so it doesn't block
+    waiting for engines; engines register dynamically via the empty-payload
+    re-registration path.
+    """
+    rank = int(os.environ.get("RANK", "0"))
+
+    if rank == 0:
+        spawn_context = multiprocessing.get_context('spawn')
+        pipe_parent, pipe_child = spawn_context.Pipe()
+        ready_event = spawn_context.Event()
+        proc = spawn_context.Process(
+            target=DataParallelInferenceCoordinator.entrypoint,
+            kwargs={
+                "pipe_connection": pipe_child,
+                "ready_event": ready_event,
+                "data_parallel_size": 0,
+                "tokenizer": DummyTokenizer(),
+                "max_requests": 16,
+                "inference_coordinator_port": DEFAULT_PORT,
+                "deterministic_mode": False,
+            },
+        )
+        proc.start()
+
+        # Wait for the coordinator to bind its socket and send the address.
+        while not pipe_parent.poll(timeout=0.1):
+            assert proc.is_alive(), "Coordinator process died during init"
+        dp_addr = pipe_parent.recv()
+        pipe_parent.close()
+        ready_event.wait(timeout=10.0)
+    else:
+        proc = None
+        # Placeholder: the engine setup broadcasts rank 0's actual address.
+        dp_addr = f"tcp://localhost:{DEFAULT_PORT}"
+
+    yield dp_addr
+
+    # Only rank 0 tears down the coordinator process.
+    if rank == 0 and proc is not None and proc.is_alive():
+        ctx = zmq.Context()
+        sock = ctx.socket(zmq.DEALER)
+        sock.connect(dp_addr)
+        sock.send(msgpack.packb([Headers.CONNECT.value], use_bin_type=True))
+        sock.recv()  # CONNECT_ACK
+        sock.send(msgpack.packb([Headers.SHUTDOWN.value], use_bin_type=True))
+        sock.close(linger=1000)
+        ctx.term()
+        proc.join(timeout=10.0)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=5.0)
+
+
 class TestCoordinator:
     """Test class for Data Parallel Inference Coordinator."""
 
@@ -194,48 +636,6 @@ class TestCoordinator:
             ("Hello world!", SamplingParams(num_tokens_to_generate=num_tokens))
             for _ in range(num_requests)
         ]
-
-    async def run_coordinator_test(
-        self,
-        *,
-        launch_coordinator=True,
-        stop_engines=True,
-        num_requests=NUM_REQUESTS,
-        num_tokens=NUM_TOKENS,
-    ):
-        """Run a coordinator test. Model parallel must already be initialized."""
-        engine = DummyEngine()
-        requests = self.build_requests(num_requests, num_tokens)
-
-        dp_addr = await engine.start_listening_to_data_parallel_coordinator(
-            inference_coordinator_port=DEFAULT_PORT, launch_inference_coordinator=launch_coordinator
-        )
-
-        try:
-            if torch.distributed.get_rank() == 0:
-                client = InferenceClient(dp_addr)
-                await client.start()
-
-                futures = [
-                    client.add_request(prompt=prompt, sampling_params=params)
-                    for prompt, params in requests
-                ]
-                results = await asyncio.wait_for(asyncio.gather(*futures), timeout=10.0)
-
-                for record in results:
-                    assert record[-1].status == Status.COMPLETED
-        finally:
-            if torch.distributed.get_rank() == 0:
-                if stop_engines:
-                    await asyncio.wait_for(client.stop_engines(), timeout=10.0)
-                client.stop()
-            if stop_engines:
-                try:
-                    await asyncio.wait_for(engine.engine_loop_task, timeout=30.0)
-                except asyncio.TimeoutError:
-                    engine.engine_loop_task.cancel()
-
-        return dp_addr
 
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
@@ -249,241 +649,628 @@ class TestCoordinator:
         ],
         indirect=["initialize_model_parallel"],
     )
-    async def test_parallel_configs(self, initialize_model_parallel):
+    async def test_parallel_configs(
+        self, initialize_model_parallel, coordinator, test_case_communicator
+    ):
         """Test coordinator with various TP, PP, and EP configurations."""
-        await self.run_coordinator_test()
-
-    @pytest.mark.internal
-    @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
-    @pytest.mark.asyncio
-    async def test_coordinator_lifecycle(self, initialize_model_parallel):
-        """Test coordinator connection and port conflict behavior."""
-        engine1 = DummyEngine()
-        engine2 = None
-        engine3 = None
-        third_addr = None
-
-        # Launch first coordinator - binds to DEFAULT_PORT
-        first_addr = await engine1.start_listening_to_data_parallel_coordinator(
-            inference_coordinator_port=DEFAULT_PORT, launch_inference_coordinator=True
-        )
-
-        try:
-            # Cancel engine1 loop without sending stop to coordinator
-            # This keeps coordinator process alive and holding the port
-            engine1.engine_loop_task.cancel()
-            try:
-                await engine1.engine_loop_task
-            except asyncio.CancelledError:
-                pass
-
-            # Connect engine2 to existing coordinator (don't launch new one)
-            engine2 = DummyEngine()
-            second_addr = await engine2.start_listening_to_data_parallel_coordinator(
-                inference_coordinator_port=DEFAULT_PORT, launch_inference_coordinator=False
-            )
-
-            # Should connect to same port, but will not always in CI due to port conflicts.
-            first_port = int(first_addr.rsplit(":", 1)[-1])
-            second_port = int(second_addr.rsplit(":", 1)[-1])
-            # assert second_port == first_port
-
-            # Cancel engine2
-            engine2.engine_loop_task.cancel()
-            try:
-                await engine2.engine_loop_task
-            except asyncio.CancelledError:
-                pass
-
-            # Launch new coordinator - should get different port since first is holding it
-            engine3 = DummyEngine()
-            third_addr = await engine3.start_listening_to_data_parallel_coordinator(
-                inference_coordinator_port=DEFAULT_PORT, launch_inference_coordinator=True
-            )
-
-            # Verify we got a different port due to conflict
-            third_port = int(third_addr.rsplit(":", 1)[-1])
-            assert (
-                third_port != first_port
-            ), f"Expected different port due to conflict, but got same: {third_port}"
-
-        finally:
-            # Clean up engine3's coordinator
-            if engine3 is not None and third_addr is not None:
-                client3 = InferenceClient(third_addr)
-                await client3.start()
-                await asyncio.wait_for(client3.stop_engines(), timeout=10.0)
-                client3.stop()
-                try:
-                    await asyncio.wait_for(engine3.engine_loop_task, timeout=30.0)
-                except asyncio.TimeoutError:
-                    engine3.engine_loop_task.cancel()
-
-            # Rebuild engine and reconnect to engine1's coordinator
-            first_port = int(first_addr.rsplit(":", 1)[-1])
-            engine1 = DummyEngine()
-            await engine1.start_listening_to_data_parallel_coordinator(
-                inference_coordinator_port=first_port, launch_inference_coordinator=False
-            )
-            client1 = InferenceClient(first_addr)
-            await client1.start()
-            await asyncio.wait_for(client1.stop_engines(), timeout=10.0)
-            client1.stop()
-            try:
-                await asyncio.wait_for(engine1.engine_loop_task, timeout=30.0)
-            except asyncio.TimeoutError:
-                engine1.engine_loop_task.cancel()
-
-    @pytest.mark.internal
-    @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
-    @pytest.mark.asyncio
-    async def test_pause(self, initialize_model_parallel):
-        """Test pause and resume functionality."""
+        dp_addr = coordinator
+        port = int(dp_addr.rsplit(":", 1)[-1])
+        requests = self.build_requests()
         engine = DummyEngine()
-        requests = self.build_requests(num_requests=32)
+        rank = torch.distributed.get_rank()
 
-        dp_addr = await engine.start_listening_to_data_parallel_coordinator(
-            inference_coordinator_port=DEFAULT_PORT, launch_inference_coordinator=True
+        await engine.start_listening_to_data_parallel_coordinator(
+            inference_coordinator_port=port, launch_inference_coordinator=False
         )
 
-        success = True
+        # Ensure all engines are registered before submitting requests.
+        await asyncio.wait_for(test_case_communicator.all_reduce_max(1), timeout=30.0)
+
+        client = None
         try:
-            if torch.distributed.get_rank() == 0:
+            if rank == 0:
+                await asyncio.sleep(0)
                 client = InferenceClient(dp_addr)
-                await client.start()
-
-                # Submit requests and pause after completion.
-                futures = [client.add_request(prompt=p, sampling_params=s) for p, s in requests[:2]]
-                await asyncio.sleep(0.1)
-                awaitables = futures + [client.pause_engines()]
-                try:
-                    await asyncio.wait_for(asyncio.gather(*awaitables), timeout=0.5)
-                except asyncio.TimeoutError:
-                    pytest.fail("Pause operation timed out.")
-
-                # Ensure that requests can be added while paused.
-                prompt, params = requests[2]
-                future = client.add_request(prompt=prompt, sampling_params=params)
-                with pytest.raises(asyncio.TimeoutError):
-                    await asyncio.wait_for(future, timeout=0.1)
-
-                # Resume and verify new requests complete.
-                client.unpause_engines()
-                # TODO: The system should not be incorrectly raising a cancelled error here.
-                with pytest.raises(asyncio.CancelledError):
-                    await future
+                client.start()
 
                 futures = [
-                    client.add_request(prompt=p, sampling_params=s) for p, s in requests[3:4]
+                    client.add_request(prompt=prompt, sampling_params=params)
+                    for prompt, params in requests
                 ]
-                await asyncio.sleep(0.1)
-                try:
-                    await asyncio.wait_for(asyncio.gather(*futures), timeout=0.5)
-                except asyncio.TimeoutError:
-                    pytest.fail("Resumed requests did not complete in time.")
-        except:
-            success = False
+                results = await asyncio.wait_for(asyncio.gather(*futures), timeout=10.0)
+
+                for result in results:
+                    assert result["status"] == Status.COMPLETED.name
+
+            await asyncio.wait_for(test_case_communicator.all_reduce_max(1), timeout=30.0)
         finally:
-            try:
-                if torch.distributed.get_rank() == 0:
-                    await asyncio.wait_for(client.stop_engines(), timeout=5.0)
-                    client.stop()
-                await asyncio.wait_for(engine.engine_loop_task, timeout=30.0)
-            except asyncio.TimeoutError:
-                engine.engine_loop_task.cancel()
-        assert success, "Pause/resume test failed."
+            await cleanup_engine(engine, client)
 
     @pytest.mark.internal
     @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
     @pytest.mark.asyncio
-    async def test_throughput(self, initialize_model_parallel):
-        """Throughput test with no TP or PP."""
-        num_requests = 10**4
+    @pytest.mark.parametrize("deserialize", [True, False], ids=["deserialize", "raw"])
+    async def test_deserialize_flag(
+        self, initialize_model_parallel, coordinator, test_case_communicator, deserialize
+    ):
+        """Test that the correct response type is returned based on the deserialize flag."""
+        dp_addr = coordinator
+        port = int(dp_addr.rsplit(":", 1)[-1])
+        engine = DummyEngine()
+        requests = self.build_requests(num_requests=2)
+
+        await engine.start_listening_to_data_parallel_coordinator(
+            inference_coordinator_port=port, launch_inference_coordinator=False
+        )
+
+        # Ensure all engines are registered before submitting requests.
+        await asyncio.wait_for(test_case_communicator.all_reduce_max(1), timeout=30.0)
+
+        client = None
+        try:
+            if torch.distributed.get_rank() == 0:
+                await asyncio.sleep(0)
+                client = InferenceClient(dp_addr, deserialize=deserialize)
+                client.start()
+                futures = [
+                    client.add_request(prompt=prompt, sampling_params=params)
+                    for prompt, params in requests
+                ]
+                results = await asyncio.wait_for(asyncio.gather(*futures), timeout=10.0)
+                for result in results:
+                    if deserialize:
+                        assert isinstance(result, DynamicInferenceRequest)
+                        assert result.generated_text == ""
+                    else:
+                        assert isinstance(result, dict)
+                        assert result["generated_text"] == ""
+                        assert "requests" not in result
+
+            await asyncio.wait_for(test_case_communicator.all_reduce_max(1), timeout=30.0)
+        finally:
+            await cleanup_engine(engine, client)
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "initialize_model_parallel",
+        [pytest.param((2, 2, 2), id="tp2-pp2-ep2")],
+        indirect=["initialize_model_parallel"],
+    )
+    async def test_control_logic_lifecycle(
+        self, initialize_model_parallel, coordinator, test_case_communicator
+    ):
+        """Comprehensive lifecycle test for the engine state machine."""
+        # States where paused stays set: once set during PAUSE, it's only cleared by UNPAUSE.
+        PAUSED_FAMILY = {
+            EngineState.PAUSED,
+            EngineState.UNPAUSING,
+            EngineState.SUSPENDING,
+            EngineState.SUSPENDED,
+            EngineState.RESUMING,
+            EngineState.STOPPING,
+            EngineState.STOPPED,
+        }
+
+        def assert_state(eng, expected):
+            """Assert engine state and all four event flags are consistent."""
+            assert eng.state == expected, f"Expected state {expected}, got {eng.state}"
+            assert eng._state_events[EngineState.RUNNING].is_set() == (
+                expected == EngineState.RUNNING
+            ), f"RUNNING.is_set()={eng._state_events[EngineState.RUNNING].is_set()} for state={expected}"
+            assert eng._state_events[EngineState.PAUSED].is_set() == (
+                expected in PAUSED_FAMILY
+            ), f"PAUSED.is_set()={eng._state_events[EngineState.PAUSED].is_set()} for state={expected}"
+            assert eng._state_events[EngineState.SUSPENDED].is_set() == (
+                expected == EngineState.SUSPENDED
+            ), f"SUSPENDED.is_set()={eng._state_events[EngineState.SUSPENDED].is_set()} for state={expected}"
+            assert eng._state_events[EngineState.STOPPED].is_set() == (
+                expected == EngineState.STOPPED
+            ), f"STOPPED.is_set()={eng._state_events[EngineState.STOPPED].is_set()} for state={expected}"
+
+        dp_addr = coordinator
+        port = int(dp_addr.rsplit(":", 1)[-1])
+        requests = self.build_requests(num_requests=16)
+        engine = DummyEngine()
+        client = None
+        doomed_futures = []
+        rank = torch.distributed.get_rank()
+
+        try:
+            await engine.start_listening_to_data_parallel_coordinator(
+                inference_coordinator_port=port, launch_inference_coordinator=False
+            )
+
+            # Synchronize all ranks so every engine has registered.
+            # Use test_case_communicator to avoid colliding with engine-internal barriers.
+            await asyncio.wait_for(test_case_communicator.all_reduce_max(1), timeout=30.0)
+
+            if rank == 0:
+                client = InferenceClient(dp_addr)
+                client.start()
+
+                await asyncio.wait_for(engine.wait_until(EngineState.RUNNING), timeout=5.0)
+                assert_state(engine, EngineState.RUNNING)
+
+                # Try to submit signals out of FSM order.
+                # The coordinator's state machine filters these out.
+                client.suspend_engines()
+                await asyncio.sleep(0.1)
+                assert_state(engine, EngineState.RUNNING)
+                client.resume_engines()
+                await asyncio.sleep(0.1)
+                assert_state(engine, EngineState.RUNNING)
+                client.stop_engines()
+                await asyncio.sleep(0.1)
+                assert_state(engine, EngineState.RUNNING)
+
+                # Submit and complete requests while running.
+                futures = [client.add_request(prompt=p, sampling_params=s) for p, s in requests[:2]]
+                results = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
+                for result in results:
+                    assert result["status"] == Status.COMPLETED.name
+
+                # Submit requests while RUNNING, then PAUSE before they drain.
+                # These must survive the PAUSE (not be drained during PAUSING).
+                pre_pause_futures = [
+                    client.add_request(prompt=p, sampling_params=s) for p, s in requests[2:3]
+                ]
+                client.pause_engines()
+                await asyncio.wait_for(engine.wait_until(EngineState.PAUSED), timeout=5.0)
+                assert_state(engine, EngineState.PAUSED)
+
+                # Pre-pause requests must NOT have been drained.
+                done, pending = await asyncio.wait(pre_pause_futures, timeout=0.5)
+                assert len(pending) > 0, "Pre-pause requests should not drain during PAUSING"
+
+                # Try pausing again and see if it breaks.
+                client.pause_engines()
+                await asyncio.sleep(0.1)
+                assert_state(engine, EngineState.PAUSED)
+
+                # Requests submitted while PAUSED should queue, not complete.
+                paused_futures = [
+                    client.add_request(prompt=p, sampling_params=s) for p, s in requests[3:5]
+                ]
+                # Use asyncio.wait (not wait_for) so futures aren't cancelled.
+                done, pending = await asyncio.wait(paused_futures, timeout=0.5)
+                assert len(done) == 0, "No requests should complete while paused"
+                assert len(pending) == 2
+
+                # UNPAUSE and verify all in-flight requests (pre-pause + paused) complete.
+                client.unpause_engines()
+                await asyncio.wait_for(engine.wait_until(EngineState.RUNNING), timeout=5.0)
+                all_queued = pre_pause_futures + paused_futures
+                results = await asyncio.wait_for(asyncio.gather(*all_queued), timeout=10.0)
+                for result in results:
+                    assert result["status"] == Status.COMPLETED.name
+                assert_state(engine, EngineState.RUNNING)
+
+                # Engine processes new requests normally after unpause.
+                futures = [
+                    client.add_request(prompt=p, sampling_params=s) for p, s in requests[5:7]
+                ]
+                results = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
+                for result in results:
+                    assert result["status"] == Status.COMPLETED.name
+
+                # Suspend.
+                client.pause_engines()
+                await asyncio.wait_for(engine.wait_until(EngineState.PAUSED), timeout=5.0)
+                assert_state(engine, EngineState.PAUSED)
+
+                client.suspend_engines()
+                await asyncio.wait_for(engine.wait_until(EngineState.SUSPENDED), timeout=5.0)
+                assert_state(engine, EngineState.SUSPENDED)
+
+                # Try pausing again and see if it breaks.
+                client.pause_engines()
+                await asyncio.sleep(0.1)
+                assert_state(engine, EngineState.SUSPENDED)
+
+                # Try suspending again and see if it breaks.
+                client.pause_engines()
+                await asyncio.sleep(0.1)
+                assert_state(engine, EngineState.SUSPENDED)
+
+                # Resume.
+                client.resume_engines()
+                await asyncio.wait_for(engine.wait_until(EngineState.RESUMED), timeout=5.0)
+                assert_state(engine, EngineState.PAUSED)
+                assert not engine._state_events[EngineState.SUSPENDED].is_set()
+
+                # Engine processes requests after suspend/resume cycle.
+                client.unpause_engines()
+                await asyncio.wait_for(engine.wait_until(EngineState.RUNNING), timeout=5.0)
+
+                futures = [
+                    client.add_request(prompt=p, sampling_params=s) for p, s in requests[7:10]
+                ]
+                results = await asyncio.wait_for(asyncio.gather(*futures), timeout=5.0)
+                for result in results:
+                    assert result["status"] == Status.COMPLETED.name
+
+                # Submit requests that will be cancelled on STOP.
+                client.pause_engines()
+                await asyncio.wait_for(engine.wait_until(EngineState.PAUSED), timeout=5.0)
+                assert_state(engine, EngineState.PAUSED)
+
+                doomed_futures = [
+                    client.add_request(prompt=p, sampling_params=s) for p, s in requests[10:13]
+                ]
+
+            # Synchronize all ranks before STOP.
+            await asyncio.wait_for(test_case_communicator.all_reduce_max(1), timeout=30.0)
+
+            if rank == 0:
+                # Verify doomed futures are still pending.
+                for f in doomed_futures:
+                    assert not f.done(), "Client futures should still be pending"
+                client.stop_engines()
+
+            await asyncio.wait_for(engine.wait_until(EngineState.STOPPED), timeout=60.0)
+            assert_state(engine, EngineState.STOPPED)
+
+        finally:
+            await cleanup_engine(engine, client)
+
+        # cleanup_engine called client.stop() which cancels pending futures.
+        if torch.distributed.get_rank() == 0:
+            for f in doomed_futures:
+                assert f.cancelled(), "Client futures should be cancelled after client.stop()"
+
+    @pytest.mark.internal
+    @pytest.mark.skipif(not HAVE_ZMQ, reason="pyzmq is required for this test")
+    @pytest.mark.asyncio
+    async def test_throughput(self, initialize_model_parallel, coordinator, test_case_communicator):
+        """Throughput benchmark: measures ZMQ packet rate."""
+        _, dp, _, _, _ = initialize_model_parallel
+        num_requests = 10**3
         num_iterations = 10
 
+        dp_addr = coordinator
+        port = int(dp_addr.rsplit(":", 1)[-1])
         engine = DummyEngine()
         requests = self.build_requests(num_requests=num_requests)
 
-        start_time = time.time()
-        dp_addr = await engine.start_listening_to_data_parallel_coordinator(
-            inference_coordinator_port=DEFAULT_PORT, launch_inference_coordinator=True
+        await engine.start_listening_to_data_parallel_coordinator(
+            inference_coordinator_port=port, launch_inference_coordinator=False
         )
 
+        # Ensure all engines are registered before submitting requests.
+        await asyncio.wait_for(test_case_communicator.all_reduce_max(1), timeout=30.0)
+
+        client = None
         try:
             if torch.distributed.get_rank() == 0:
                 client = InferenceClient(dp_addr)
-                await client.start()
-                init_time = time.time()
+                client.start()
 
+                start_time = time.time()
                 for _ in range(num_iterations):
                     futures = []
-                    for prompt, sampling_params in tqdm(requests, "add_requests"):
+                    for prompt, sampling_params in requests:
                         fut = client.add_request(prompt=prompt, sampling_params=sampling_params)
                         futures.append(fut)
-                    await asyncio.wait_for(asyncio.gather(*futures), timeout=10.0)
-                done_time = time.time()
+                    await asyncio.wait_for(asyncio.gather(*futures), timeout=30.0)
+                elapsed_ms = (time.time() - start_time) * 1e3
+                total = num_requests * num_iterations // dp
+                print(
+                    f"ZMQ throughput: {total / elapsed_ms:.2f} requests/ms "
+                    f"({total} reqs in {elapsed_ms:.0f} ms)"
+                )
+            await asyncio.wait_for(test_case_communicator.all_reduce_max(1), timeout=30.0)
         finally:
-            if torch.distributed.get_rank() == 0:
-                await asyncio.wait_for(client.stop_engines(), timeout=10.0)
-                client.stop()
-            try:
-                await asyncio.wait_for(engine.engine_loop_task, timeout=30.0)
-            except asyncio.TimeoutError:
-                engine.engine_loop_task.cancel()
+            await cleanup_engine(engine, client, timeout=60.0)
 
-        stop_time = time.time()
 
-        flags = torch.tensor([1, 1, 1], dtype=torch.int, device=torch.cuda.current_device())
+def _set_hash_rank(coord, h, rank_identity, timestamp):
+    """Test helper: set a hash→rank timestamp in the coordinator's dict."""
+    rank_idx = coord.identity_to_rank_index[rank_identity]
+    coord._hash_table.setdefault(h, {})[rank_idx] = timestamp
 
-        init_duration = golden_init_duration = None
-        run_duration = golden_run_duration = None
-        stop_duration = golden_stop_duration = None
 
-        if torch.distributed.get_rank() == 0:
-            init_duration = (init_time - start_time) * 10**3
-            golden_init_duration = 6974.43  # ms
-            run_duration = (done_time - init_time) * 10**3
-            golden_run_duration = 4392.63  # ms
-            stop_duration = (stop_time - done_time) * 10**3
-            golden_stop_duration = 931.49  # ms
+def _make_routing_coordinator(
+    num_ranks=4, enable_prefix_caching=False, policy=PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
+):
+    """Create a coordinator with fake rank identities for routing-only tests.
 
-            def clamp_to_golden_value(value, golden_value, delta=0.1):
-                return value > golden_value * (1 - delta) and value < golden_value * (1 + delta)
+    Thin wrapper around the shared helper in coordinator_test_utils.py.
+    """
+    from tests.unit_tests.inference.coordinator_test_utils import (
+        make_coordinator_direct as _make_coordinator,
+    )
 
-            if not clamp_to_golden_value(init_duration, golden_init_duration, delta=0.5):
-                flags[0] = 0
-            if not clamp_to_golden_value(run_duration, golden_run_duration, delta=0.2):
-                flags[1] = 0
-            if not clamp_to_golden_value(stop_duration, golden_stop_duration, delta=1.0):
-                flags[2] = 0
+    return _make_coordinator(
+        data_parallel_size=num_ranks,
+        block_size_tokens=64,
+        enable_prefix_caching=enable_prefix_caching,
+        policy=policy,
+        rank_name_template="rank-{}",
+    )
 
-        # Synchronize results
-        torch.distributed.broadcast(flags, src=0)
 
-        if torch.distributed.get_rank() == 0:
-            print(f"Initialization time: {init_duration:.2f} ms")
-            print(f"Run time: {run_duration:.2f} ms")
-            print(f"Stop time: {stop_duration:.2f} ms")
+class TestRoutingPolicies:
+    """Unit tests for routing behavior under different policies and load conditions."""
 
-            assert flags[0].item() == 1, (
-                f"WARNING: Init duration {init_duration:.2f}s deviates from "
-                f"golden value {golden_init_duration:.2f}s"
+    @pytest.mark.parametrize(
+        "loads,affinity,capacity,alpha,expected",
+        [
+            ([2, 0], None, None, 0.0, b"a"),
+            ([0, 0], None, None, 0.0, b"z"),
+            ([0, 2], None, [0.25, 0.75], 1.0, b"a"),
+            ([2, 0], None, [0.5, 0.5], 0.0, b"a"),
+            ([0, 0], None, [0.5, 0.5], 0.0, b"z"),
+            ([1, 0], [1.0, 0.0], [0.25, 1.0], 0.0, b"z"),
+            ([1, 0], [1.0, 0.0], [0.25, 1.0], 1.0, b"a"),
+            ([0, 0], [1.0, 1.0], [0.25, 1.0], 1.0, b"z"),
+        ],
+    )
+    def test_stateless_selection(self, loads, affinity, capacity, alpha, expected):
+        identities = [b"z", b"a"]  # Rank order, not lexical identity order.
+        loads = np.array(loads)
+        affinity = None if affinity is None else np.array(affinity)
+        capacity = None if capacity is None else np.array(capacity)
+        for array in (loads, affinity, capacity):
+            if array is not None:
+                array.flags.writeable = False
+        assert (
+            select_engine(
+                identities,
+                loads,
+                affinity_scores=affinity,
+                available_fractions=capacity,
+                routing_alpha=alpha,
             )
-            assert flags[1].item() == 1, (
-                f"WARNING: Run duration {run_duration:.2f}s deviates from "
-                f"golden value {golden_run_duration:.2f}s"
-            )
-            assert flags[2].item() == 1, (
-                f"WARNING: Stop duration {stop_duration:.2f}s deviates from "
-                f"golden value {golden_stop_duration:.2f}s"
+            == expected
+        )
+        assert identities == [b"z", b"a"]
+        with pytest.raises(RuntimeError, match="No engines connected"):
+            select_engine([], np.array([]))
+
+    @pytest.mark.parametrize("header", [Headers.RELEASE_KV, Headers.RELEASE_KV_OWNER])
+    def test_handoff_release_retries_after_source_disconnect(self, header):
+        coord = _make_routing_coordinator(num_ranks=1)
+        coord.instance_id = "source-instance"
+        coord.known_clients = {b"client"}
+        for request_id, owner in ((7, "old"), (8, "replacement")):
+            coord.handoff_ownership.offer(request_id, b"rank-0")
+            assert coord.handoff_ownership.claim(request_id, owner) is HandoffClaimStatus.ACCEPTED
+        # Routing eviction is not evidence that the source freed its allocations.
+        coord._remove_engine(b"rank-0")
+        metadata = (
+            [header.value, 7, coord.instance_id]
+            if header == Headers.RELEASE_KV
+            else [header.value, coord.instance_id, "old"]
+        )
+        coord.router_socket = unittest.mock.MagicMock(
+            send_multipart=unittest.mock.MagicMock(side_effect=zmq.ZMQError(zmq.EHOSTUNREACH))
+        )
+        HANDLERS[header](coord, b"client", metadata, [])
+        # Only delivery to the source was attempted; no successful ACK to the client.
+        assert coord.router_socket.send_multipart.call_count == 1
+        assert coord.router_socket.send_multipart.call_args.args[0][0] == b"rank-0"
+        assert coord.handoff_ownership.source_engine(7) == b"rank-0"
+        assert coord.handoff_ownership.claim(7, "other") is HandoffClaimStatus.REJECTED
+
+        coord._handle_rank_registration(b"rank-0")
+        coord.router_socket.send_multipart.reset_mock(side_effect=True)
+        HANDLERS[header](coord, b"client", metadata, [])
+        release, ack = coord.router_socket.send_multipart.call_args_list
+        assert release.args[0][0] == b"rank-0"
+        assert msgpack.unpackb(release.args[0][1]) == [Headers.RELEASE_KV.value, 7]
+        assert ack.args[0][0] == b"client"
+        assert coord.handoff_ownership.source_engine(7) is None
+        assert coord.handoff_ownership.source_engine(8) == b"rank-0"
+
+    def test_no_prefix_caching_uses_load_balanced(self):
+        """When prefix caching is off, routing goes to the least-loaded rank."""
+        coord = _make_routing_coordinator(num_ranks=3, enable_prefix_caching=False)
+        coord._pending_counts[coord.identity_to_rank_index[b"rank-0"]] = 2
+        coord._pending_counts[coord.identity_to_rank_index[b"rank-1"]] = 1
+
+        # rank-2 has the fewest in-flight requests (0).
+        assert coord.get_best_data_parallel_rank([]) == b"rank-2"
+
+    def test_empty_hashes_uses_load_balanced(self):
+        """Empty hash list falls back to the least-loaded rank."""
+        coord = _make_routing_coordinator(num_ranks=4)
+        coord._pending_counts[coord.identity_to_rank_index[b"rank-0"]] = 3
+        coord._pending_counts[coord.identity_to_rank_index[b"rank-1"]] = 5
+        coord._pending_counts[coord.identity_to_rank_index[b"rank-2"]] = 1
+        coord._pending_counts[coord.identity_to_rank_index[b"rank-3"]] = 4
+
+        assert coord.get_best_data_parallel_rank([]) == b"rank-2"
+
+    def test_prefix_affinity_routing(self):
+        """When prefix caching is on with hashes, scoring picks the best rank."""
+        coord = _make_routing_coordinator(
+            num_ranks=3,
+            enable_prefix_caching=True,
+            policy=PrefixCachingCoordinatorPolicy.LONGEST_PREFIX,
+        )
+        for ident in coord.identities_of_data_parallel_ranks:
+            coord._pending_counts[coord.identity_to_rank_index[ident]] = 1
+
+        # Seed a hash on rank-2 so prefix routing prefers it.
+        fake_hash = 12345
+        _set_hash_rank(coord, fake_hash, b"rank-2", 1)
+
+        chosen = coord.get_best_data_parallel_rank([fake_hash])
+        assert chosen == b"rank-2"
+
+    def test_prefix_affinity_beats_free_capacity(self):
+        """A rank with a prefix match and capacity is preferred over a free rank."""
+        coord = _make_routing_coordinator(
+            num_ranks=3,
+            enable_prefix_caching=True,
+            policy=PrefixCachingCoordinatorPolicy.LONGEST_PREFIX,
+        )
+        coord._pending_counts[coord.identity_to_rank_index[b"rank-0"]] = 2
+        coord._pending_counts[coord.identity_to_rank_index[b"rank-1"]] = 1
+
+        fake_hash = 99999
+        _set_hash_rank(coord, fake_hash, b"rank-1", 1)
+
+        # Scoring: rank-1 gets prefix match bonus, which outweighs rank-2's
+        # free capacity advantage.
+        chosen = coord.get_best_data_parallel_rank([fake_hash])
+        assert chosen == b"rank-1"
+
+    def test_free_capacity_wins_when_prefix_rank_is_full(self):
+        """A free rank wins when the prefix-matched rank is saturated."""
+        coord = _make_routing_coordinator(
+            num_ranks=2,
+            enable_prefix_caching=True,
+            policy=PrefixCachingCoordinatorPolicy.FIRST_PREFIX_BLOCK,
+        )
+        coord.prefix_caching_routing_alpha = 0.5
+        coord._pending_counts[coord.identity_to_rank_index[b"rank-0"]] = 10
+
+        fake_hash = 42
+        _set_hash_rank(coord, fake_hash, b"rank-0", 1)
+
+        # mean 5 -> relative_load [+1, -1]; scores tie at 0.5 and the tiebreak
+        # goes to the least loaded rank.
+        chosen = coord.get_best_data_parallel_rank([fake_hash])
+        assert chosen == b"rank-1"
+
+    def test_load_balanced_policy_ignores_prefix(self):
+        """LOAD_BALANCED policy routes to the least-loaded rank, ignoring prefix affinity."""
+        coord = _make_routing_coordinator(
+            num_ranks=3,
+            enable_prefix_caching=True,
+            policy=PrefixCachingCoordinatorPolicy.LOAD_BALANCED,
+        )
+        coord._pending_counts[coord.identity_to_rank_index[b"rank-0"]] = 2
+        coord._pending_counts[coord.identity_to_rank_index[b"rank-1"]] = 1
+
+        # Seed a prefix match on the most-loaded rank; load balancing must ignore it.
+        _set_hash_rank(coord, 99, b"rank-0", 1)
+
+        assert coord.get_best_data_parallel_rank([99]) == b"rank-2"
+
+    def test_reply_routing_survives_engine_removal(self, caplog):
+        """A removed engine's queued replies still deliver; never-connected senders assert."""
+
+        def reply(fid):
+            """An ENGINE_REPLY as (metadata, body frames), matching the wire format.
+
+            The metadata frame carries only the routing key and the detokenize
+            flag; the finished request travels as an opaque body frame.
+            """
+            metadata = [Headers.ENGINE_REPLY.value, [[fid, True]]]
+            bodies = [
+                msgpack.packb(
+                    {"request_id": fid, "generated_tokens": [10, 11, 12], "sampling_params": {}},
+                    use_bin_type=True,
+                )
+            ]
+            return metadata, bodies
+
+        coord = _make_routing_coordinator(num_ranks=2)
+        coord.tokenizer = DummyTokenizer()
+        coord.request_id_to_client_id = {11: b"client-A"}
+        coord.request_id_to_client_request_id = {11: 7}
+        coord.client_request_to_request_id = {(b"client-A", 7): 11}
+        coord.request_id_to_rank = {}
+        coord.router_socket = unittest.mock.MagicMock()
+
+        # A sender that never registered is a protocol violation.
+        with pytest.raises(AssertionError, match="never-connected"):
+            handle_engine_reply(coord, b"impostor", *reply(11))
+        assert coord.router_socket.send_multipart.call_count == 0
+        assert 11 in coord.request_id_to_client_id
+
+        # Removal happens on failed *sends*, so the removed engine's in-flight
+        # reply can still arrive - and must reach its client.
+        coord._remove_engine(b"rank-0")
+        with caplog.at_level(logging.WARNING):
+            handle_engine_reply(coord, b"rank-0", *reply(11))
+        assert "removed engine" in caplog.text
+        assert coord.tokenizer.detokenize_calls == [[10, 11, 12]]
+        assert coord.router_socket.send_multipart.call_args[0][0][0] == b"client-A"
+        assert 11 not in coord.request_id_to_client_id
+
+        # A duplicated or delayed completion cannot be routed after the first
+        # reply releases its client mapping, but it must not kill the coordinator.
+        with caplog.at_level(logging.WARNING):
+            handle_engine_reply(coord, b"rank-0", *reply(11))
+        assert "duplicate or late ENGINE_REPLY" in caplog.text
+        assert coord.router_socket.send_multipart.call_count == 1
+
+    def test_unsafe_terminal_error_keeps_routing_until_safety_ack(self):
+        coord = _make_routing_coordinator(num_ranks=1)
+        coord.router_socket = unittest.mock.MagicMock()
+        coord.request_id_to_client_id = {11: b"client-A"}
+        coord.request_id_to_client_request_id = {11: 7}
+        coord.client_request_to_request_id = {(b"client-A", 7): 11}
+        coord.request_id_to_rank = {11: b"rank-0"}
+        coord._pending_counts[0] = 1
+
+        HANDLERS[Headers.REQUEST_ERROR](
+            coord, b"rank-0", [Headers.REQUEST_ERROR.value, 11, "failed", False], []
+        )
+
+        assert coord.request_id_to_client_id == {11: b"client-A"}
+        assert coord.request_id_to_client_request_id == {11: 7}
+        assert coord.client_request_to_request_id == {(b"client-A", 7): 11}
+        assert coord.request_id_to_rank == {11: b"rank-0"}
+        assert coord._pending_counts[0] == 1
+
+        HANDLERS[Headers.REQUEST_ABORTED](
+            coord, b"rank-0", [Headers.REQUEST_ABORTED.value, 11, True], []
+        )
+
+        assert coord.request_id_to_client_id == {}
+        assert coord.request_id_to_client_request_id == {}
+        assert coord.client_request_to_request_id == {}
+        assert coord.request_id_to_rank == {}
+        assert coord._pending_counts[0] == 0
+
+    def test_late_partial_reply_is_ignored(self, caplog):
+        coord = _make_routing_coordinator(num_ranks=1)
+        coord.router_socket = unittest.mock.MagicMock()
+        coord.request_id_to_client_id = {}
+        coord.request_id_to_client_request_id = {}
+
+        with caplog.at_level(logging.WARNING):
+            HANDLERS[Headers.ENGINE_REPLY_PARTIAL](
+                coord,
+                b"rank-0",
+                [Headers.ENGINE_REPLY_PARTIAL.value, [11]],
+                [msgpack.packb({"request_id": 11}, use_bin_type=True)],
             )
 
-            print(
-                f"ZMQ throughput is approximately "
-                f"{num_requests * num_iterations / run_duration:.2f} "
-                f"requests/ms"
-            )
-        else:
-            assert flags[0].item() == 1
-            assert flags[1].item() == 1
-            assert flags[2].item() == 1
+        assert "late ENGINE_REPLY_PARTIAL" in caplog.text
+        coord.router_socket.send_multipart.assert_not_called()
+
+
+def test_engine_reply_defaults_to_detokenizing():
+    """A client that says nothing still gets its reply detokenized.
+
+    Coordinator-side detokenization was unconditional before reply bodies became
+    opaque frames. Keeping the default on means the frames change is invisible to
+    clients that relied on it; only a client that opts out pays nothing for it.
+    """
+    from megatron.core.inference.sampling_params import SamplingParams
+
+    metadata = msgpack.unpackb(
+        _engine_reply_frames([{"request_id": 3, "sampling_params": SamplingParams().serialize()}])[
+            0
+        ],
+        raw=False,
+    )
+    assert metadata[1] == [[3, True]]
+
+
+def test_engine_reply_honours_an_opt_out():
+    """A client that detokenizes for itself lets the coordinator skip the body."""
+    from megatron.core.inference.sampling_params import SamplingParams
+
+    params = SamplingParams(detokenize_generations=False).serialize()
+    metadata = msgpack.unpackb(
+        _engine_reply_frames([{"request_id": 4, "sampling_params": params}])[0], raw=False
+    )
+    assert metadata[1] == [[4, False]]

@@ -1,7 +1,12 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-# python checkpoint_inspector.py inspect /path/to/checkpoint
-# torchrun --nproc_per_node=8 --nnodes=1 checkpoint_inspector.py convert-torch-dist-to-fsdp-dtensor /path/to/input_checkpoint /path/to/output_checkpoint --swiglu
+# Usage examples:
+#   python checkpoint_inspector.py inspect /path/to/checkpoint
+#
+#   torchrun --nproc_per_node=8 --nnodes=1 checkpoint_inspector.py \
+#       convert-torch-dist-to-fsdp-dtensor \
+#       /path/to/input_checkpoint /path/to/output_checkpoint \
+#       --swiglu-modules language_model --rename-mtp-keys
 import gc
 import io
 import json
@@ -10,6 +15,7 @@ from pathlib import Path
 import time
 import re
 import shutil
+from collections.abc import Iterable
 from typing import Optional
 import tempfile
 
@@ -31,21 +37,22 @@ from torch.distributed.checkpoint.metadata import (
 from torch.distributed.checkpoint.state_dict_saver import _save_state_dict
 from torch.distributed.tensor import DeviceMesh, Replicate, Shard
 
-from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import split_dtensor, gather_uneven_dtensor_to_full_tensor
+from megatron.core.distributed.fsdp.src.megatron_fsdp.uneven_dtensor import split_dtensor, redistribute_uneven_dtensor_to_replicated
 
-from megatron.core.dist_checkpointing.serialization import (
-    get_default_load_sharded_strategy,
-)
+from megatron.core.dist_checkpointing.serialization import load_common_state_dict
 from megatron.core.dist_checkpointing.strategies.fully_parallel import (
     FullyParallelLoadStrategyWrapper,
 )
 from megatron.core.dist_checkpointing.strategies.torch import (
     TorchDistLoadShardedStrategy,
 )
-from megatron.core.dist_checkpointing.validation import (
-    verify_checkpoint_and_load_strategy,
-)
+from megatron.core.dist_checkpointing.validation import verify_checkpoint
 from megatron.core.msc_utils import MultiStorageClientFeature
+
+
+# Key under which megatron stores non-sharded state inside a torch_dist DCP store;
+# its unique_key is "common_state/shard_0_1" (see dist_checkpointing/serialization.py).
+_COMMON_STATE_KEY = "common_state"
 
 
 def rank0_echo(message):
@@ -96,11 +103,9 @@ def inspect(checkpoint_dir, enable_msc, not_ignore_param_to_group_meta):
 
     try:
         # Strategies initialization
-        sharded_strategy = get_default_load_sharded_strategy(checkpoint_dir)
+        sharded_strategy = TorchDistLoadShardedStrategy()
         sharded_strategy = FullyParallelLoadStrategyWrapper(sharded_strategy)
-        sharded_strategy, common_strategy = verify_checkpoint_and_load_strategy(
-            checkpoint_dir, sharded_strategy, common_strategy=None
-        )
+        verify_checkpoint(checkpoint_dir)
         assert isinstance(
             sharded_strategy.base_strategy, TorchDistLoadShardedStrategy
         ), click.style(
@@ -108,7 +113,7 @@ def inspect(checkpoint_dir, enable_msc, not_ignore_param_to_group_meta):
         )
 
         # Common state section
-        common_state = common_strategy.load_common(checkpoint_dir)
+        common_state = load_common_state_dict(checkpoint_dir)
         print_header(f"common state ({len(common_state)} items)", "cyan")
         for key, value in common_state.items():
             bullet = click.style("•", fg="magenta")
@@ -342,15 +347,81 @@ def convert_checkpoint(
     optimizer_state_prefix="optimizer.state.module.module.module",
     model_weight_prefix="model.module",
     param_to_param_group_map={},
+    rename_mtp_keys=False,
+    swiglu_modules=None,
+    renumber_hybrid_layers=None,
 ):
-    """Convert a Megatron Core Distributed Checkpoint from torch_dist to standard fsdp_dtensor format."""
+    """Convert a Megatron Core Distributed Checkpoint from torch_dist to fsdp_dtensor format.
+
+    \b
+    Model-specific flags
+    ====================
+    Different model architectures require different conversion flags.
+    Use the table below to determine which flags your model needs:
+
+    \b
+      Flag               When to use                              Auto-detected?
+      ─────────────────  ───────────────────────────────────────  ──────────────
+      --swiglu-modules   Model uses SWiGLU activation in MLP.     No (manual).
+                         Check HuggingFace config for              Specify which
+                         "hidden_act": "silu" + gate_proj.         modules use it.
+      --swiglu           Same as above, but applies globally       No (manual).
+                         to ALL modules. Use --swiglu-modules
+                         if only some modules use SWiGLU.
+      --rename-mtp-keys  Model uses Multi-Token Prediction          YES.
+                         (MTP) with 'transformer_layer' naming
+                         in the torch_dist checkpoint.
+
+    \b
+    Auto-detection: --rename-mtp-keys is auto-detected from checkpoint keys
+    if not explicitly set. --swiglu / --swiglu-modules must always be specified
+    manually because SWiGLU and GeLU MLP weights are indistinguishable in the
+    MCore torch_dist format.
+
+    \b
+    Examples
+    ========
+    Qwen3.5-VL (SWiGLU in language_model only, has GDN + MTP):
+      torchrun --nproc_per_node=8 checkpoint_inspector.py \\
+        convert-torch-dist-to-fsdp-dtensor \\
+        /path/to/torch_dist /path/to/fsdp_dtensor \\
+        --swiglu-modules language_model
+
+    Model with SWiGLU in all modules, no GDN/MTP:
+      torchrun --nproc_per_node=8 checkpoint_inspector.py \\
+        convert-torch-dist-to-fsdp-dtensor \\
+        /path/to/torch_dist /path/to/fsdp_dtensor \\
+        --swiglu
+    """
     device_mesh = DeviceMesh.from_group(process_group, device_type="cuda")
 
     # 1. Initialize state_dict with proper metadata
     reader = FileSystemReader(input_dir)
     metadata = reader.read_metadata()
+    # Decide the layer-numbering question up front. The authoritative map is rebuilt
+    # after the transforms, but the source keys already carry the decoder indices, so a
+    # missing --renumber-hybrid-layers can be caught here in seconds rather than after
+    # loading and transforming the whole checkpoint.
+    section_prefixes = (model_weight_prefix, optimizer_state_prefix)
+    if renumber_hybrid_layers is None and _hybrid_layer_index_map(
+        metadata.state_dict_metadata, section_prefixes
+    ):
+        raise NotImplementedError(
+            "This checkpoint numbers layers by hybrid-pattern position (sparse indices, "
+            "because a fused compute+moe block consumes two pattern slots). Pass "
+            "--renumber-hybrid-layers to emit the dense 0..n-1 numbering a "
+            "ModuleList-indexed model expects, or --no-renumber-hybrid-layers to keep "
+            "the checkpoint's numbering."
+        )
+
     state_dict = {}
     for key, md in metadata.state_dict_metadata.items():
+        if key.split("/", maxsplit=1)[0] == _COMMON_STATE_KEY:
+            # Non-sharded state (args, iteration, ...) is stored inside the torch_dist
+            # store as a single ShardedObject. It is read separately below via
+            # load_common_state_dict() and flattened into the fsdp_dtensor namespace;
+            # loading it here too would write it back out as an opaque blob.
+            continue
         if isinstance(md, TensorStorageMetadata):
             # Initialize tensor storage
             assert len(md.size) > 0, (
@@ -374,11 +445,45 @@ def convert_checkpoint(
     elapsed_time = time.time() - start_time
     rank0_echo(f"[Load] Finished loading state_dict in {elapsed_time:.2f}s.")
 
+    # --- Resolve SWiGLU scope ---
+    # --swiglu-modules (per-module) takes priority over --swiglu (global).
+    if swiglu_modules is not None:
+        _swiglu_prefixes = list(swiglu_modules)
+        rank0_echo(f"[SWiGLU] Per-module splitting enabled for: {_swiglu_prefixes}")
+    elif swiglu:
+        _swiglu_prefixes = None  # None = match everything (backward compatible)
+        rank0_echo("[SWiGLU] Global splitting enabled (all modules).")
+    else:
+        _swiglu_prefixes = []    # no SWiGLU splitting
+        rank0_echo("[SWiGLU] Disabled (no --swiglu or --swiglu-modules specified).")
+
+    # --- Auto-detect MTP from checkpoint keys ---
+    # GDN sub-keys are kept un-merged; handle_gdn_in_state_dict() in
+    # fsdp_dtensor_checkpoint.py wraps each sub-tensor with correct TP metadata
+    # at runtime.
+    all_keys = list(state_dict.keys())
+    _detected = []
+
+    if not rename_mtp_keys and any(
+        ".mtp.layers." in k and ".transformer_layer." in k
+        for k in all_keys
+    ):
+        rename_mtp_keys = True
+        _detected.append("MTP (transformer_layer -> mtp_model_layer rename needed)")
+
+    if _detected:
+        rank0_echo(
+            "[Auto-detect] Enabled transformations based on checkpoint keys:\n"
+            + "\n".join(f"  - {d}" for d in _detected)
+        )
+    del all_keys
+
     # Handle optimizer state and module parameters
     fsdp_dtensor_state_dict = {}
     rerun_state_machine_state = None
     process_count = 0
     total_items = len(state_dict)
+    _swiglu_split_count = 0
 
     def _free_up_some_gpu_memory():
         if check_gpu_memory(0.5):
@@ -399,7 +504,7 @@ def convert_checkpoint(
         _free_up_some_gpu_memory()
         layers = {}
         for i, v in enumerate(split_dtensor(value, 1, dim=0)):
-            v = gather_uneven_dtensor_to_full_tensor(v).reshape(
+            v = redistribute_uneven_dtensor_to_replicated(v).reshape(
                 orig_shape[1:] if orig_shape else value.shape[1:]
             ).redistribute(placements=[Shard(0)])
 
@@ -428,7 +533,7 @@ def convert_checkpoint(
             else:
                 raise ValueError(f"Unexpected expert layer key: {layer_key}")
 
-            expert_weight = gather_uneven_dtensor_to_full_tensor(expert_weight)
+            expert_weight = redistribute_uneven_dtensor_to_replicated(expert_weight)
             expert_shape = orig_shape[1:] if orig_shape else value.shape[1:]
             # Handle optimizer states for expert linear_fc2 when ETP is enabled
             if (
@@ -456,29 +561,38 @@ def convert_checkpoint(
             experts[expert_key] = expert_weight
         return experts
 
+    _SWIGLU_PATTERNS = [
+        r"(.*)\.mlp\.linear_fc1\.weight",
+        r"(.*)\.mlp\.linear_fc1\.bias",
+        r"(.*)\.mlp\.experts\.linear_fc1\.weight(\d+)",
+        r"(.*)\.mlp\.experts\.linear_fc1\.bias(\d+)",
+        r"(.*)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.weight",
+        r"(.*)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.bias",
+        r"(.*)\.mlp\.shared_experts\.linear_fc1\.weight",
+        r"(.*)\.mlp\.shared_experts\.linear_fc1\.bias",
+    ]
+
     def is_swiglu_key(key):
-        return any(re.search(pat, key) for pat in [
-            r"(.*)\.mlp\.linear_fc1\.weight",
-            r"(.*)\.mlp\.linear_fc1\.bias",
-            r"(.*)\.mlp\.experts\.linear_fc1\.weight(\d+)",
-            r"(.*)\.mlp\.experts\.linear_fc1\.bias(\d+)",
-            r"(.*)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.weight",
-            r"(.*)\.mlp\.experts\.local_experts\.(\d+)\.linear_fc1\.bias",
-            r"(.*)\.mlp\.shared_experts\.linear_fc1\.weight",
-            r"(.*)\.mlp\.shared_experts\.linear_fc1\.bias",
-        ])
+        if not any(re.search(pat, key) for pat in _SWIGLU_PATTERNS):
+            return False
+        # _swiglu_prefixes=None means global (--swiglu), match all.
+        # _swiglu_prefixes=[] means nothing detected, match none.
+        # _swiglu_prefixes=["language_model", ...] means per-module match.
+        if _swiglu_prefixes is None:
+            return True
+        return any(f".{mod}." in key or key.startswith(f"{mod}.") for mod in _swiglu_prefixes)
 
     def split_swiglu_weight(key: str, value: torch.Tensor) -> dict[str, torch.Tensor]:
         """
-        Split SwiGLU weights into separate tensors.
+        Split SwiGLU weights/biases into separate _w and _v tensors.
         """
-        value = gather_uneven_dtensor_to_full_tensor(value)
+        value = redistribute_uneven_dtensor_to_replicated(value)
         swiglu_w_and_v = {}
         w, v = torch.chunk(value, 2, dim=0)
         w = w.redistribute(placements=[Shard(0)])
         v = v.redistribute(placements=[Shard(0)])
-        w_key = re.sub(r'(weight\d*)(.*)', r'\1_w\2', key)
-        v_key = re.sub(r'(weight\d*)(.*)', r'\1_v\2', key)
+        w_key = re.sub(r'((?:weight|bias)\d*)(.*)', r'\1_w\2', key)
+        v_key = re.sub(r'((?:weight|bias)\d*)(.*)', r'\1_v\2', key)
         swiglu_w_and_v[w_key] = w
         swiglu_w_and_v[v_key] = v
         return swiglu_w_and_v
@@ -509,8 +623,10 @@ def convert_checkpoint(
                 is_param = True
 
             # Handle dist-opt flatten tensors
+            _has_mcore = hasattr(metadata, "mcore_data")
             if (
-                key in metadata.mcore_data
+                _has_mcore
+                and key in metadata.mcore_data
                 and "nd_reformulated_orig_global_shape" in metadata.mcore_data[key]
             ):
                 mcore_data = metadata.mcore_data[key]
@@ -531,7 +647,7 @@ def convert_checkpoint(
                 split_tensors = split_expert_weights(new_key, value, orig_shape)
             else:
                 if orig_shape:
-                    value = gather_uneven_dtensor_to_full_tensor(value)
+                    value = redistribute_uneven_dtensor_to_replicated(value)
                     # Handle optimizer states with partition_dim=1 when TP is enabled
                     if (
                         new_key.startswith("optimizer.state.")
@@ -553,12 +669,15 @@ def convert_checkpoint(
                         value = value.reshape(orig_shape).redistribute(placements=[Shard(0)])
                 split_tensors = {new_key: value}
 
-            # Handle SWiGLU weights
-            for key, value in list(split_tensors.items()):
-                if swiglu and is_swiglu_key(key):
-                    swiglu_w_and_v = split_swiglu_weight(key, value)
+            # Handle SWiGLU weights (per-module: only for modules in _swiglu_prefixes)
+            # Bind to distinct names: `key`/`value` are the outer while-loop's variables
+            # and are still needed below for the param-group lookup.
+            for split_key, split_value in list(split_tensors.items()):
+                if is_swiglu_key(split_key):
+                    swiglu_w_and_v = split_swiglu_weight(split_key, split_value)
                     split_tensors.update(swiglu_w_and_v)
-                    del split_tensors[key]
+                    del split_tensors[split_key]
+                    _swiglu_split_count += 1
 
             fsdp_dtensor_state_dict.update(split_tensors)
             if is_param and key in param_to_param_group_map:
@@ -597,35 +716,112 @@ def convert_checkpoint(
             torch.save(value, serialized_data)
             fsdp_dtensor_state_dict[key] = serialized_data
 
+    if _swiglu_split_count > 0:
+        rank0_echo(f"[SWiGLU] Split {_swiglu_split_count} fc1 keys into _w/_v pairs.")
+    elif _swiglu_prefixes is not None and len(_swiglu_prefixes) > 0:
+        rank0_echo("[SWiGLU] WARNING: modules specified but 0 keys were split — check module names.")
+
+    # Rename MTP keys: torch_dist uses "transformer_layer" for MTP sub-modules,
+    # but the FSDP model's state_dict() uses "mtp_model_layer".
+    if rename_mtp_keys:
+        _MTP_OLD = ".mtp.layers."
+        _MTP_SRC = ".transformer_layer."
+        _MTP_DST = ".mtp_model_layer."
+        renamed_count = 0
+        for k in list(fsdp_dtensor_state_dict.keys()):
+            if _MTP_OLD in k and _MTP_SRC in k:
+                new_k = k.replace(_MTP_SRC, _MTP_DST, 1)
+                fsdp_dtensor_state_dict[new_k] = fsdp_dtensor_state_dict.pop(k)
+                if k in param_to_param_group_map:
+                    param_to_param_group_map[new_k] = param_to_param_group_map.pop(k)
+                renamed_count += 1
+        if renamed_count > 0:
+            rank0_echo(f"[MTP rename] Renamed {renamed_count} keys: "
+                       f"'transformer_layer' -> 'mtp_model_layer'.")
+
+    # Hybrid layer renumbering. A checkpoint written with pattern-position numbering
+    # leaves holes where a fused compute+moe block consumed two pattern slots; a model
+    # that numbers by ModuleList index expects a dense range. Getting this wrong puts
+    # almost every layer on the wrong index and loads silently, so a sparse namespace is
+    # a hard error unless the caller has explicitly chosen a numbering.
+    # Safety net: the early check above runs on the source keys, this one on the final
+    # key space, which the layer/expert splits may have reshaped.
+    # Skipped entirely under --no-renumber-hybrid-layers: the caller has chosen to keep
+    # the checkpoint's numbering, so neither the map nor its consistency check applies.
+    _layer_index_map = (
+        {} if renumber_hybrid_layers is False
+        else _hybrid_layer_index_map(fsdp_dtensor_state_dict, section_prefixes)
+    )
+    if _layer_index_map and renumber_hybrid_layers is None:
+        _example = sorted(_layer_index_map)[0]
+        raise NotImplementedError(
+            f"Layer indices under '{_example}' are sparse "
+            f"({sorted(_layer_index_map[_example])[:8]}...), i.e. the checkpoint numbers "
+            "layers by hybrid-pattern position. Pass --renumber-hybrid-layers to emit the "
+            "dense 0..n-1 numbering a ModuleList-indexed model expects, or "
+            "--no-renumber-hybrid-layers to keep the checkpoint's numbering."
+        )
+    if renumber_hybrid_layers:
+        fsdp_dtensor_state_dict, _n_renum = _renumber_hybrid_layers(
+            fsdp_dtensor_state_dict, _layer_index_map
+        )
+        if _n_renum:
+            rank0_echo(
+                f"[Layers] Renumbered {_n_renum} keys across "
+                f"{len(_layer_index_map)} namespace(s) to a dense 0..n-1 range."
+            )
+            _remapped = _renumber_param_group_map(
+                param_to_param_group_map, _layer_index_map
+            )
+            param_to_param_group_map.clear()
+            param_to_param_group_map.update(_remapped)
+
     # Move back to GPU if necessary
     for key in fsdp_dtensor_state_dict:
         if isinstance(fsdp_dtensor_state_dict[key], torch.Tensor):
             fsdp_dtensor_state_dict[key] = fsdp_dtensor_state_dict[key].cuda()
 
-    # Check MCore data
-    for key, value in list(metadata.mcore_data.items()):
-        if len(value) == 0:
-            del metadata.mcore_data[key]
-    if len(metadata.mcore_data) != 0 and torch.distributed.get_rank() == 0:
-        click.echo(
-            click.style(
-                f"Warning: {metadata.mcore_data.keys()} MCore data items were not processed.",
-                fg="yellow",
+    # Merge Gated DeltaProduct in_proj/conv1d sub-keys back into the fused parameters
+    # the FSDP model exposes. Runs after the layer split so every key carries an
+    # explicit layer index and the section axis is unambiguously dim 0.
+    fsdp_dtensor_state_dict, _n_gdp, _gdp_merged = _merge_deltaproduct_projections(
+        fsdp_dtensor_state_dict
+    )
+    if _n_gdp:
+        rank0_echo(f"[DeltaProduct] Merged {_n_gdp} fused in_proj/conv1d projections.")
+        # Rename only the sub-keys the merge actually consumed. Re-matching the regex
+        # here would also catch Mamba-2 / Gated-DeltaNet ".z" keys, which the merge
+        # deliberately leaves alone -- deleting their param-group entries while the
+        # state dict still holds them aborts the conversion.
+        for name, fused in _gdp_merged.items():
+            if name in param_to_param_group_map:
+                param_to_param_group_map.setdefault(fused, param_to_param_group_map[name])
+                del param_to_param_group_map[name]
+
+
+    # Check MCore data (may not exist for pretrained-only checkpoints)
+    if hasattr(metadata, "mcore_data"):
+        for key, value in list(metadata.mcore_data.items()):
+            if len(value) == 0:
+                del metadata.mcore_data[key]
+        if len(metadata.mcore_data) != 0 and torch.distributed.get_rank() == 0:
+            click.echo(
+                click.style(
+                    f"Warning: {metadata.mcore_data.keys()} MCore data items were not processed.",
+                    fg="yellow",
+                )
             )
-        )
 
     # Handle args, optimizer.param_groups and other shared objects.
-    sharded_strategy = get_default_load_sharded_strategy(input_dir)
+    sharded_strategy = TorchDistLoadShardedStrategy()
     sharded_strategy = FullyParallelLoadStrategyWrapper(sharded_strategy)
-    sharded_strategy, common_strategy = verify_checkpoint_and_load_strategy(
-        input_dir, sharded_strategy, common_strategy=None
-    )
+    verify_checkpoint(str(input_dir))
     assert isinstance(sharded_strategy.base_strategy, TorchDistLoadShardedStrategy), (
         click.style(
             f"Unsupported sharded strategy: {sharded_strategy}", fg="red", bold=True
         )
     )
-    common_state = common_strategy.load_common(input_dir)
+    common_state = load_common_state_dict(input_dir)
     try:
         if "param_groups" in common_state["optimizer"]:
             ckpt_param_groups = common_state["optimizer"]["param_groups"]
@@ -676,7 +872,17 @@ def convert_checkpoint(
 @click.option(
     "--swiglu",
     is_flag=True,
-    help="SwiGLU is used in checkpoint, and MLP linear_fc1 is specially treated.",
+    help="Split SWiGLU fc1 weights/biases into _w and _v for ALL modules. "
+         "Use --swiglu-modules instead if only some modules use SWiGLU (e.g. VLMs). "
+         "NOT auto-detected; must be specified manually.",
+)
+@click.option(
+    "--swiglu-modules",
+    type=str,
+    default=None,
+    help="Comma-separated module names that use SWiGLU (e.g. 'language_model'). "
+         "Only these modules will have fc1 split into _w/_v. Overrides --swiglu. "
+         "NOT auto-detected; must be specified manually.",
 )
 @click.option(
     "--oom-traceback", is_flag=True, help="Enable OOM traceback for debugging."
@@ -695,20 +901,87 @@ def convert_checkpoint(
 @click.option(
     "--param-to-param-group-map-json",
     type=str,
-    default="{}",
-    help="JSON string representing the param to parameter group map."
+    default=None,
+    help="Path to a JSON file mapping parameter names to optimizer param group ids. "
+         "Required only if the source checkpoint has multiple optimizer param groups "
+         "(e.g. different LR/weight-decay per group). Leave unset for single-group checkpoints."
+)
+@click.option(
+    "--renumber-hybrid-layers/--no-renumber-hybrid-layers",
+    default=None,
+    help="Choose the decoder layer numbering when the source checkpoint numbers layers by "
+         "hybrid-pattern position (sparse indices, because a fused compute+moe block "
+         "consumes two pattern slots). --renumber-hybrid-layers emits the dense 0..n-1 "
+         "numbering a ModuleList-indexed model expects; --no-renumber-hybrid-layers keeps "
+         "the checkpoint's numbering. Required whenever sparse indices are detected.",
+)
+@click.option(
+    "--rename-mtp-keys",
+    is_flag=True,
+    help="Rename MTP layer keys from 'transformer_layer' to 'mtp_model_layer' "
+         "to match the FSDP model's state_dict naming. "
+         "Auto-detected if not set: enabled when '.mtp.layers.*.transformer_layer' "
+         "keys are found in the checkpoint.",
 )
 def convert_torch_dist_to_fsdp_dtensor(
     input_dir,
     output_dir,
     swiglu,
+    swiglu_modules,
     oom_traceback,
     enable_msc,
     output_optimizer_state_prefix,
     output_model_weight_prefix,
     param_to_param_group_map_json,
+    rename_mtp_keys,
+    renumber_hybrid_layers,
 ):
-    """Convert a Megatron Core Distributed Checkpoint from torch_dist to fsdp_dtensor format."""
+    """Convert a Megatron Core Distributed Checkpoint from torch_dist to fsdp_dtensor format.
+
+    \b
+    Model-specific flags
+    ====================
+    Different model architectures require different conversion flags.
+    Use the guide below to determine which flags your model needs:
+
+    \b
+      Flag               When to use                            Auto-detected?
+      ─────────────────  ────────────────────────────────────── ──────────────
+      --swiglu-modules   Model uses SWiGLU activation in MLP.   No (manual).
+                         Check HuggingFace config for            Specify which
+                         "hidden_act": "silu" + gate_proj.       modules use it.
+      --swiglu           Same as above, but applies globally     No (manual).
+                         to ALL modules. Use --swiglu-modules
+                         if only some modules use SWiGLU.
+      --rename-mtp-keys  Model uses Multi-Token Prediction        YES.
+                         (MTP) with 'transformer_layer' naming
+                         in the torch_dist checkpoint.
+
+    \b
+    Auto-detection note:
+      --rename-mtp-keys is auto-detected from checkpoint keys if not explicitly
+      set. --swiglu / --swiglu-modules must always be specified manually.
+
+    \b
+    Examples
+    ========
+    Qwen3.5-VL (SWiGLU in language_model only, has GDN + MTP):
+
+    \b
+      torchrun --nproc_per_node=8 checkpoint_inspector.py \\
+        convert-torch-dist-to-fsdp-dtensor \\
+        /path/to/torch_dist /path/to/fsdp_dtensor \\
+        --swiglu-modules language_model
+
+    \b
+    Model with SWiGLU in all modules, no GDN/MTP:
+
+    \b
+      torchrun --nproc_per_node=8 checkpoint_inspector.py \\
+        convert-torch-dist-to-fsdp-dtensor \\
+        /path/to/torch_dist /path/to/fsdp_dtensor \\
+        --swiglu
+    """
     if not enable_msc:
         MultiStorageClientFeature.disable()
 
@@ -746,13 +1019,23 @@ def convert_torch_dist_to_fsdp_dtensor(
 
     ckpt_path = Path(input_dir)
     output_dir = Path(output_dir)
-    with open(param_to_param_group_map_json, "r") as f:
-        param_to_param_group_map = json.load(f)
+    if param_to_param_group_map_json:
+        with open(param_to_param_group_map_json, "r") as f:
+            param_to_param_group_map = json.load(f)
+    else:
+        param_to_param_group_map = {}
+    _swiglu_modules = (
+        [m.strip() for m in swiglu_modules.split(",") if m.strip()]
+        if swiglu_modules is not None else None
+    )
     convert_checkpoint(
         ckpt_path, output_dir, swiglu, process_group=dist.group.WORLD,
         optimizer_state_prefix=output_optimizer_state_prefix,
         model_weight_prefix=output_model_weight_prefix,
         param_to_param_group_map=param_to_param_group_map,
+        rename_mtp_keys=rename_mtp_keys,
+        swiglu_modules=_swiglu_modules,
+        renumber_hybrid_layers=renumber_hybrid_layers,
     )
 
     click.echo(
@@ -760,6 +1043,269 @@ def convert_torch_dist_to_fsdp_dtensor(
             f"Converted checkpoint saved to {output_dir}.", fg="green", bold=True
         )
     )
+
+
+# Gated DeltaProduct stores one checkpoint key per section of its fused
+# ``in_proj``/``conv1d`` parameters. ``named_parameters()`` (and therefore the
+# fsdp_dtensor layout) keeps them fused; only ``sharded_state_dict`` splits them.
+# Structural half: everything up to and including the fused parameter name, then the
+# remainder. The remainder is picked apart in Python below rather than in the pattern.
+_GDP_PARAM_RE = re.compile(
+    r"^(?P<param>.*\.(?P<kind>in_proj|conv1d)\.(?:weight|bias))\.(?P<rest>.+)$"
+)
+
+# Section names emitted by ``sharded_state_dict``: the input gate ``z``, the decay
+# ``a``, the query ``Q``, and a ``V<i>``/``K<i>``/``b<i>`` triple per householder
+# reflection. Anything else under a fused projection is not a DeltaProduct section.
+_GDP_SECTION_RE = re.compile(r"^(?:z|a|Q|[VKb]\d+)$")
+
+
+def _parse_deltaproduct_subkey(key: str) -> Optional[tuple[str, str, str, str]]:
+    """Pick a Gated DeltaProduct sub-key apart into its four meaningful pieces.
+
+    Returns ``(param, kind, section, tail)``, or ``None`` when *key* is not a fused
+    projection sub-key at all::
+
+        "decoder.layers.3.mixer.in_proj.weight.V1"
+            -> ("decoder.layers.3.mixer.in_proj.weight", "in_proj", "V1", "")
+        "optimizer.state.exp_avg.decoder.layers.3.mixer.conv1d.weight.K0"
+            -> ("optimizer.state.exp_avg....conv1d.weight", "conv1d", "K0", "")
+        "decoder.layers.3.mixer.in_proj.weight.z.exp_avg"
+            -> ("decoder.layers.3.mixer.in_proj.weight", "in_proj", "z", ".exp_avg")
+
+    ``tail`` is whatever follows the section (an optimizer state name, or empty for a
+    model weight) and is re-appended verbatim to the fused key, so a parameter and its
+    optimizer states merge into their own separate fused tensors.
+    """
+    match = _GDP_PARAM_RE.match(key)
+    if match is None:
+        return None
+    section, _, tail = match.group("rest").partition(".")
+    if not _GDP_SECTION_RE.match(section):
+        return None
+    return match.group("param"), match.group("kind"), section, f".{tail}" if tail else ""
+
+
+def _gdp_split_names(num_householder: int, is_conv: bool) -> list[str]:
+    """Sub-key order for a Gated DeltaProduct fused projection.
+
+    Mirrors ``_get_in_proj_checkpoint_split_layout`` / ``_get_conv_checkpoint_split_layout``
+    in megatron/core/ssm/gated_delta_product.py. The fused tensor is exactly the
+    concatenation of these sections along dim 0, in this order, so the order is the
+    contract between the two directions — do not sort it.
+
+    Args:
+        num_householder: number of householder reflections the mixer composes per step
+            (``gdp_num_householder``). DeltaProduct generalises DeltaNet by applying this
+            many rank-one updates per token instead of one, and the mixer therefore
+            projects one ``V<i>``/``K<i>``/``b<i>`` section per reflection while the
+            shared sections (``z``, ``Q``, ``a``) stay single. The count is what makes
+            the section list — and so the concatenation order — well defined.
+        is_conv: whether the layout is for ``conv1d`` rather than ``in_proj``. The short
+            convolution sees only the sections it mixes over time (``V*``, ``K*``, ``Q``);
+            the gate, the betas and the decay never reach it.
+    """
+    v = [f"V{i}" for i in range(num_householder)]
+    k = [f"K{i}" for i in range(num_householder)]
+    if is_conv:
+        return v + k + ["Q"]
+    b = [f"b{i}" for i in range(num_householder)]
+    return ["z"] + v + k + ["Q"] + b + ["a"]
+
+
+def _merge_deltaproduct_projections(
+    tensors: dict[str, torch.Tensor]
+) -> tuple[dict[str, torch.Tensor], int, dict[str, str]]:
+    """Merge Gated DeltaProduct ``in_proj``/``conv1d`` sub-keys back into fused params.
+
+    The inverse of ``GatedDeltaProductMixer.sharded_state_dict``: torch_dist stores
+    ``mixer.in_proj.weight.{z,V*,K*,Q,b*,a}`` and ``mixer.conv1d.weight.{V*,K*,Q}`` as
+    separate keys, while ``named_parameters()`` — and so the fsdp_dtensor checkpoint —
+    holds one fused tensor per projection.
+
+    The householder count is recovered from the sub-keys present rather than from the
+    checkpoint ``args``, which keeps the transform model-free and lets the observed key
+    set validate itself: a set that is not exactly the expected one raises rather than
+    silently emitting a mis-ordered concatenation. Applies to model weights and to their
+    ``optimizer.state.*`` counterparts, which carry the sub-key in the same position
+    followed by the state name.
+    """
+    groups = {}
+    for key in tensors:
+        parsed = _parse_deltaproduct_subkey(key)
+        if parsed is None:
+            continue
+        param, kind, section, tail = parsed
+        # Scope to ``.mixer.``: GatedDeltaNet splits self_attention.in_proj.weight into
+        # query/key/value/z/beta/alpha, which also yields a bare ``.z`` sub-key.
+        if ".mixer." not in param:
+            continue
+        groups.setdefault((param, tail, kind), {})[section] = key
+
+    if not groups:
+        return tensors, 0, {}
+
+    out = dict(tensors)
+    n_merged = 0
+    merged_keys = {}  # sub-key -> fused key, for the param-group fixup
+    for (param, tail, kind), members in groups.items():
+        num_householder = sum(1 for section in members if re.fullmatch(r"V\d+", section))
+        # Mamba-2 splits mixer.in_proj.weight into z,x,B,C,dt, of which only ``z``
+        # resembles a DeltaProduct sub-key. A group with no householder sections is
+        # therefore not DeltaProduct at all -- leave it exactly as the converter found
+        # it, which is what the forward path does for every other fused mixer.
+        if num_householder == 0:
+            continue
+        expected = _gdp_split_names(num_householder, kind == "conv1d")
+        if set(members) != set(expected):
+            raise NotImplementedError(
+                f"Gated DeltaProduct sub-keys for '{param}{tail}' are "
+                f"{sorted(members)}, expected {expected} (num_householder="
+                f"{num_householder}). Refusing to guess the concatenation order."
+            )
+        # The merge concatenates along dim 0, which is only the section axis once the
+        # layer index is explicit. A stacked block carries a leading num-layers axis
+        # instead, and concatenating along that would silently splice layers together.
+        if ".layers." in param and not re.search(r"\.layers\.\d+\.", param):
+            raise NotImplementedError(
+                f"Gated DeltaProduct sub-keys for '{param}{tail}' have no explicit layer "
+                "index, so the leading axis is the layer axis rather than the section "
+                "axis. Split the stacked block into per-layer keys before merging."
+            )
+        # Every section is a leading-axis slice of the fused parameter. Gather each
+        # shard to replicated before concatenating, then re-shard the fused result --
+        # cat along a sharded axis is not the same tensor.
+        parts = []
+        for section in expected:
+            value = out.pop(members[section])
+            if isinstance(value, torch.distributed.tensor.DTensor):
+                value = redistribute_uneven_dtensor_to_replicated(value)
+            parts.append(value)
+        fused = torch.cat(parts, dim=0)
+        if isinstance(fused, torch.distributed.tensor.DTensor):
+            fused = fused.redistribute(placements=[Shard(0)])
+        out[f"{param}{tail}"] = fused
+        for section in expected:
+            merged_keys[members[section]] = f"{param}{tail}"
+        n_merged += 1
+    return out, n_merged, merged_keys
+
+
+_LAYER_INDEX_RE = re.compile(r"^(?P<prefix>.*\.layers\.)(?P<idx>\d+)(?P<rest>\..*)$")
+
+
+def _hybrid_layer_index_map(
+    keys: Iterable[str], section_prefixes: tuple[str, ...] = ()
+) -> dict[str, dict[int, int]]:
+    """Map sparse hybrid-pattern layer indices onto dense ``0..n-1``, per namespace.
+
+    A hybrid model whose checkpoint was written with pattern-position numbering indexes
+    its decoder layers by their offset into the layer-pattern string, so a fused
+    ``compute_layer``+``moe_layer`` block consumes two positions and leaves a hole. A
+    model that numbers by ``ModuleList`` index instead expects a dense range, and the
+    two disagree for every layer after the first hole.
+
+    ``section_prefixes`` are the configured model / optimizer key prefixes; they are what
+    makes a model namespace and its optimizer namespace reduce to the same suffix.
+
+    Returns ``{prefix: {old_index: new_index}}`` covering only the namespaces that are
+    actually sparse; dense ones are omitted so this is a no-op for them. Relative order
+    is preserved, which is what makes the remap well defined: both numberings walk the
+    same layers in the same order, they just label them differently.
+    """
+    per_prefix = {}
+    for key in keys:
+        m = _LAYER_INDEX_RE.match(key)
+        if m is not None:
+            per_prefix.setdefault(m.group("prefix"), set()).add(int(m.group("idx")))
+
+    # A parameter and its optimizer state live under different prefixes but the same
+    # trailing module path, and must be renumbered identically. Deriving a map per
+    # prefix independently would silently diverge if one namespace were missing a layer,
+    # so require the index sets to agree.
+    by_suffix = {}
+    for prefix, indices in per_prefix.items():
+        # Normalise away the section and the DDP/FSDP wrapper levels, so that e.g.
+        # "model.module.module.language_model.decoder.layers." and
+        # "optimizer.state.module.module.module.language_model.decoder.layers."
+        # both reduce to "language_model.decoder.layers.".
+        # Strip whichever section prefix this key carries. The prefixes are passed in
+        # from the caller's configuration -- deriving them from a regex of the default
+        # spellings silently stops reconciling model against optimizer as soon as
+        # --output-model-weight-prefix or --output-optimizer-state-prefix is set, and
+        # the two namespaces then renumber independently.
+        suffix = prefix
+        for sp in sorted(section_prefixes, key=len, reverse=True):
+            sp = sp if sp.endswith(".") else sp + "."
+            if suffix.startswith(sp):
+                suffix = suffix[len(sp):]
+                break
+        else:
+            suffix = re.sub(r"^optimizer\.state\.", "", suffix)
+            suffix = re.sub(r"^(?:model\d*\.|module\.)+", "", suffix)
+        by_suffix.setdefault(suffix, {})[prefix] = indices
+    for suffix, group in by_suffix.items():
+        # Only namespaces that are actually sparse get renumbered, so when every one of
+        # them is already dense a disagreement changes nothing and must not abort the
+        # conversion -- a layer frozen out of the optimizer state is the common case.
+        if all(sorted(v) == list(range(len(v))) for v in group.values()):
+            continue
+        distinct = {tuple(sorted(v)) for v in group.values()}
+        if len(distinct) > 1:
+            raise NotImplementedError(
+                f"Layer namespaces ending '{suffix}' disagree on which layers exist: "
+                f"{ {p: sorted(v)[:8] for p, v in group.items()} }. Renumbering them "
+                "independently would put a parameter and its optimizer state on "
+                "different indices."
+            )
+
+    index_map = {}
+    for prefix, indices in per_prefix.items():
+        ordered = sorted(indices)
+        if ordered == list(range(len(ordered))):
+            continue  # already dense
+        index_map[prefix] = {old: new for new, old in enumerate(ordered)}
+    return index_map
+
+
+def _renumber_param_group_map(
+    param_to_param_group_map: dict[str, int], index_map: dict[str, dict[int, int]]
+) -> dict[str, int]:
+    """Apply a layer-index remap to parameter -> optimizer-param-group ids.
+
+    Returns a fresh dict rather than renaming in place: new indices are <= old ones, so
+    an in-place rename can overwrite an entry that has not been visited yet and silently
+    hand a layer another layer's LR / weight-decay group.
+    """
+    remapped = {}
+    for name, group_id in param_to_param_group_map.items():
+        m = _LAYER_INDEX_RE.match(name)
+        if m is not None and m.group("prefix") in index_map:
+            new_idx = index_map[m.group("prefix")][int(m.group("idx"))]
+            name = f"{m.group('prefix')}{new_idx}{m.group('rest')}"
+        remapped[name] = group_id
+    return remapped
+
+
+def _renumber_hybrid_layers(
+    tensors: dict[str, torch.Tensor], index_map: dict[str, dict[int, int]]
+) -> tuple[dict[str, torch.Tensor], int]:
+    """Rewrite layer indices according to :func:`_hybrid_layer_index_map`."""
+    if not index_map:
+        return tensors, 0
+    out = {}
+    n_renamed = 0
+    for key, value in tensors.items():
+        m = _LAYER_INDEX_RE.match(key)
+        if m is not None:
+            mapping = index_map.get(m.group("prefix"))
+            if mapping is not None:
+                new_idx = mapping[int(m.group("idx"))]
+                key = f"{m.group('prefix')}{new_idx}{m.group('rest')}"
+                n_renamed += 1
+        out[key] = value
+    return out, n_renamed
+
 
 
 def _modify_state_dict(input_dir, output_dir, ops, process_group, enable_msc=False):

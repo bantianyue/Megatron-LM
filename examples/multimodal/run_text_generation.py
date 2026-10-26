@@ -39,8 +39,14 @@ from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_w
     VLMInferenceWrapper,
 )
 from megatron.training import get_args, get_model, get_tokenizer, print_rank_0, is_last_rank
+from megatron.training.arguments import parse_and_validate_args
 from megatron.training.checkpointing import load_checkpoint
 from megatron.training.initialize import initialize_megatron
+from megatron.training.global_vars import (
+    get_run_config,
+    set_run_config,
+)
+from megatron.training.argument_utils import inference_cfg_container_from_args
 
 
 def is_first_rank():
@@ -155,6 +161,7 @@ def get_evaluation_dataloader(
 
 def generate_samples(model, config: EvaluationConfig, print_output):
     """Text generation using a trained vision language model."""
+    cfg = get_run_config()
     args = get_args()
 
     dataloader = get_evaluation_dataloader(
@@ -202,7 +209,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
             inference_wrapped_model=inference_wrapped_model, tokenizer=tokenizer
         )
         inference_engine = StaticInferenceEngine(
-            controller, max_batch_size=1, random_seed=args.seed, legacy=True
+            controller, max_batch_size=1, random_seed=cfg.rng.seed, legacy=True
         )
         sampling_params = SamplingParams(
             temperature=config.temperature,
@@ -227,7 +234,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                 inference_request = VLMInferenceRequest(
                    request_id=inference_engine.get_new_request_id(),
                    prompt=conv,
-                   prompt_tokens=controller.tokenize_prompt(conv),
+                   prompt_tokens=controller.tokenize_prompt(controller.tokenizer, conv),
                    sampling_params=sampling_params,
                    num_img_embeddings_per_tile=num_img_embeddings_per_tile,
                    imgs=imgs,
@@ -252,7 +259,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                     top_p_sampling=config.top_p,
                     add_BOS=False,
                     temperature=config.temperature,
-                    random_seed=args.seed,
+                    random_seed=cfg.rng.seed,
                     detokenize_segments=False,
                     data_parallel=True,
             )
@@ -344,7 +351,7 @@ def generate_samples(model, config: EvaluationConfig, print_output):
                 inference_request = VLMInferenceRequest(
                    request_id=inference_engine.get_new_request_id(),
                    prompt=conv,
-                   prompt_tokens=controller.tokenize_prompt(conv),
+                   prompt_tokens=controller.tokenize_prompt(controller.tokenizer, conv),
                    sampling_params=sampling_params,
                    num_img_embeddings_per_tile=num_img_embeddings_per_tile,
                    imgs=imgs,
@@ -842,7 +849,9 @@ def run_evaluation_loop(model, configs, output_dir_override=None, iteration=None
 
 def eval_tasks():
     """Vision language model text generation for single or batch tasks."""
-    initialize_megatron(extra_args_provider=add_text_generation_args)
+    args = parse_and_validate_args(extra_args_provider=add_text_generation_args)
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    initialize_megatron(training=False)
 
     args = get_args()
 

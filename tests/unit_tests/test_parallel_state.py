@@ -1,16 +1,104 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-from math import log2
+from datetime import timedelta
 
 import pytest
 import torch
 
 import megatron.core.parallel_state as ps
+from megatron.core.process_groups_config import ProcessGroupCollection
 from tests.unit_tests.test_utilities import Utils
 
 rank = Utils.rank
 world_size = Utils.world_size
 test_parallel_order = ['tp-cp-ep-dp-pp', 'tp-cp-pp-ep-dp']
+
+
+def test_inject_gtp_remat_axis():
+    # Decoder/dense axis: GTP_remat is injected after 'cp', so CP keeps the more-local
+    # (smaller-stride) placement and GTP_remat sits one step further out.
+    assert ps._inject_gtp_remat_axis('tp-cp-ep-dp-pp', after='cp') == 'tp-cp-gtp_remat-ep-dp-pp'
+    # Expert axis: EGTP is injected after 'ep' so EP (heavier all-to-all) stays more local.
+    assert ps._inject_gtp_remat_axis('tp-cp-ep-dp-pp', after='ep') == 'tp-cp-ep-gtp_remat-dp-pp'
+    # Idempotent: an order string that already contains 'gtp_remat' is returned unchanged.
+    already_injected = 'tp-cp-gtp_remat-ep-dp-pp'
+    assert ps._inject_gtp_remat_axis(already_injected, after='cp') == already_injected
+    # Falls back to 'tp' as anchor when the requested anchor token isn't present in the order.
+    assert ps._inject_gtp_remat_axis('tp-dp-pp', after='cp') == 'tp-gtp_remat-dp-pp'
+
+
+def test_cp_more_local_than_gtp_remat_rank_layout():
+    """With cp>1 and gtp_remat>1, CP ranks must have a smaller stride (more local) than
+    GTP_remat ranks. Unlike test_inject_gtp_remat_axis, this checks actual rank placement,
+    not just the order string.
+    """
+    tp_size, cp_size, gtp_remat_size, dp_size = 2, 2, 2, 2
+    order = ps._inject_gtp_remat_axis('tp-cp-ep-dp-pp', after='cp')
+    rank_generator = ps.RankGenerator(
+        tp=tp_size, ep=1, dp=dp_size, pp=1, cp=cp_size, order=order, gtp_remat=gtp_remat_size
+    )
+
+    def stride(groups):
+        strides = {sorted(g)[1] - sorted(g)[0] for g in groups}
+        assert len(strides) == 1, f"non-uniform stride across groups: {groups}"
+        return strides.pop()
+
+    cp_stride = stride(rank_generator.get_ranks('cp'))
+    gtp_remat_stride = stride(rank_generator.get_gtp_ranks(gtp_remat_size))
+
+    # CP is the second axis (after tp) -> stride == tp_size.
+    assert cp_stride == tp_size
+    # GTP_remat is the third axis (after tp, cp) -> stride == tp_size * cp_size.
+    assert gtp_remat_stride == tp_size * cp_size
+    # The property this whole change is about: CP ranks are more adjacent than GTP_remat ranks.
+    assert cp_stride < gtp_remat_stride
+
+
+def test_initialize_model_parallel_with_cp_and_gtp_remat():
+    """initialize_model_parallel(context_parallel_size>1, gtp_remat_size>1) together: the actual
+    group-construction path (cp, gtp_remat, dp, dp-cp, gtp_remat-dp-cp, tp-gtp_remat-pp), not
+    just RankGenerator math in isolation.
+    """
+    Utils.destroy_model_parallel()
+    actual_world_size = torch.cuda.device_count()
+    tp_size, cp_size, gtp_remat_size, pp_size = 1, 2, 2, 1
+    denom = tp_size * cp_size * gtp_remat_size * pp_size
+    if actual_world_size % denom != 0:
+        pytest.skip(f"Test requires world_size divisible by {denom}, but got {actual_world_size}")
+    dp_size = actual_world_size // denom
+    Utils.initialize_model_parallel(
+        tensor_model_parallel_size=tp_size,
+        context_parallel_size=cp_size,
+        gtp_remat_size=gtp_remat_size,
+    )
+
+    order = ps._inject_gtp_remat_axis('tp-cp-ep-dp-pp', after='cp')
+    rank_generator = ps.RankGenerator(
+        tp=tp_size, ep=1, dp=dp_size, pp=pp_size, cp=cp_size, order=order, gtp_remat=gtp_remat_size
+    )
+    my_rank = torch.distributed.get_rank()
+
+    def group_ranks(group):
+        return sorted(torch.distributed.get_process_group_ranks(group))
+
+    def expected_group(token):
+        for ranks in rank_generator.get_ranks(token):
+            if my_rank in ranks:
+                return sorted(ranks)
+        raise AssertionError(f"rank {my_rank} not found in any '{token}' group")
+
+    assert group_ranks(ps.get_context_parallel_group()) == expected_group('cp')
+    assert group_ranks(ps.get_gtp_weight_remat_group()) == expected_group('gtp_remat')
+    assert group_ranks(ps.get_data_parallel_group(with_gtp_remat=False)) == expected_group('dp')
+    assert group_ranks(
+        ps.get_data_parallel_group(with_context_parallel=True, with_gtp_remat=False)
+    ) == expected_group('dp-cp')
+    assert group_ranks(
+        ps.get_data_parallel_group(with_context_parallel=True, with_gtp_remat=True)
+    ) == expected_group('gtp_remat-dp-cp')
+    assert group_ranks(ps.get_model_parallel_group()) == expected_group('tp-gtp_remat-pp')
+
+    Utils.destroy_model_parallel()
 
 
 @pytest.mark.parametrize('order', test_parallel_order)
@@ -504,12 +592,12 @@ def test_rank_generator_for_tp_dp_pp(nodes, num_gpu, tp, pp, cp, ep):
 
 
 @pytest.mark.parametrize(
-    "world_size, tp_size, cp_size, dp_size",
-    [(8, 1, 2, 4), (8, 1, 1, 8)],  # 8 GPUs, 1 TP, 2 CP, 4 DP  # 8 GPUs, 1 TP, 1 CP, 8 DP
+    "world_size, tp_size, cp_size, dp_size", [(8, 1, 2, 4), (8, 1, 1, 8), (8, 2, 2, 2)]
 )
-def test_hybrid_dp_cp_groups(world_size, tp_size, cp_size, dp_size):
+def test_dynamic_dp_cp_groups(world_size, tp_size, cp_size, dp_size):
     """
-    Test that hybrid DPxCP groups are created correctly.
+    Test that every valid dynamic DPxCP group, including CP1, is created with the
+    configured timeout.
     """
     Utils.destroy_model_parallel()
 
@@ -520,41 +608,122 @@ def test_hybrid_dp_cp_groups(world_size, tp_size, cp_size, dp_size):
     Utils.initialize_model_parallel(
         tensor_model_parallel_size=tp_size,
         context_parallel_size=cp_size,
-        hybrid_context_parallel=True,
+        dynamic_context_parallel=True,
+        distributed_timeout_minutes=45,
     )
 
-    dp_cp_size = ps.get_data_parallel_world_size(with_context_parallel=True)
-    group_sizes = [2**i for i in range(int(log2(dp_cp_size)))][1:]
+    dp_cp_size = ps.get_data_parallel_world_size(with_context_parallel=True, with_gtp_remat=False)
+    group_sizes = ps.get_valid_dynamic_context_parallel_group_sizes(dp_cp_size)
     for group_size in group_sizes:
-        group = ps.get_hybrid_data_context_parallel_groups(group_size=group_size)
+        group = ps.get_dynamic_data_context_parallel_groups(group_size=group_size)
         assert group.size() == group_size
+        # distributed_timeout_minutes, not torch's default NCCL timeout (10 minutes)
+        assert group._get_backend(torch.device("cuda")).options._timeout == timedelta(minutes=45)
+        tp_dp_cp_group = ps.get_dynamic_tensor_data_context_parallel_group(group_size=group_size)
+        assert tp_dp_cp_group.size() == tp_size * group_size
 
     Utils.destroy_model_parallel()
+
+
+def test_expert_data_parallel_gloo_group_timeout():
+    """
+    Test that the expert data parallel gloo group is created with the configured timeout.
+    """
+    Utils.initialize_model_parallel(distributed_timeout_minutes=45)
+
+    group = ps.get_expert_data_parallel_group_gloo()
+    assert group._get_backend(torch.device("cpu")).options._timeout == timedelta(minutes=45)
+
+    Utils.destroy_model_parallel()
+
+
+def test_valid_dynamic_cp_group_sizes():
+    assert ps.get_valid_dynamic_context_parallel_group_sizes(8) == [1, 2, 4, 8]
+    assert ps.get_valid_dynamic_context_parallel_group_sizes(6) == [1, 2, 6]
+    assert ps.get_valid_dynamic_context_parallel_group_sizes(3) == [1, 3]
+
+    with pytest.raises(ValueError, match="must be positive"):
+        ps.get_valid_dynamic_context_parallel_group_sizes(0)
 
 
 def test_separate_all_gather_group():
-    """Test separate all-gather group for improved communication overlap."""
-    # Test without creating AG group (default)
-    Utils.initialize_model_parallel(context_parallel_size=world_size, create_all_gather_group=False)
-    assert not ps.has_separate_all_gather_group()
-    assert ps._DATA_PARALLEL_GROUP_WITH_CP_AG is None
+    """AG/RS overlap communicators live on ProcessGroupCollection (via create_all_gather_groups)."""
+    Utils.initialize_model_parallel(context_parallel_size=world_size)
+
+    dp_cp_group = ps.get_data_parallel_group(with_context_parallel=True)
+    dp_cp_ranks = torch.distributed.get_process_group_ranks(dp_cp_group)
+    dp_cp_ag_group, _expt_ag = ps.create_all_gather_groups(for_expert_parallelism=False)
+    assert dp_cp_ag_group is not None
+    ag_ranks = torch.distributed.get_process_group_ranks(dp_cp_ag_group)
+    assert ag_ranks == dp_cp_ranks, "AG group should have same ranks as dp-cp group"
+    assert dp_cp_ag_group != dp_cp_group, "AG group should be a different communicator"
+
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    pg_collection.dp_cp_ag = dp_cp_ag_group
+    assert pg_collection.dp_cp_ag is not None
+    assert pg_collection.dp_cp_ag == dp_cp_ag_group
+
     Utils.destroy_model_parallel()
 
-    # Test with creating AG group
-    Utils.initialize_model_parallel(context_parallel_size=world_size, create_all_gather_group=True)
-    assert ps.has_separate_all_gather_group()
-    assert ps._DATA_PARALLEL_GROUP_WITH_CP_AG is not None
 
-    # Verify it returns the correct group
-    ag_group = ps.get_data_parallel_group(with_context_parallel=True, independent_all_gather=True)
-    regular_group = ps.get_data_parallel_group(
-        with_context_parallel=True, independent_all_gather=False
+def test_expert_all_gather_group():
+    """Test expert AG groups for MoE models with AG/RS overlap."""
+    # Initialize model parallel with expert parallelism
+    Utils.initialize_model_parallel(
+        expert_model_parallel_size=min(2, world_size),
+        context_parallel_size=max(1, world_size // 2) if world_size > 1 else 1,
     )
-    assert ag_group is not None
-    assert regular_group is not None
-    # They should have the same ranks but different communicators
-    ag_ranks = torch.distributed.get_process_group_ranks(ag_group)
-    regular_ranks = torch.distributed.get_process_group_ranks(regular_group)
-    assert ag_ranks == regular_ranks
+
+    # Get ranks for both regular and expert AG groups
+    dp_cp_group = ps.get_data_parallel_group(with_context_parallel=True)
+    dp_cp_ranks = torch.distributed.get_process_group_ranks(dp_cp_group)
+    expt_dp_group = ps.get_expert_data_parallel_group()
+    expt_dp_ranks = torch.distributed.get_process_group_ranks(expt_dp_group)
+
+    # Create AG groups for both regular and expert parameters
+    dp_cp_ag_group = torch.distributed.new_group(ranks=dp_cp_ranks, backend='nccl')
+    expt_dp_ag_group = torch.distributed.new_group(ranks=expt_dp_ranks, backend='nccl')
+
+    # Create ProcessGroupCollection with AG groups
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+    pg_collection.dp_cp_ag = dp_cp_ag_group
+    pg_collection.expt_dp_ag = expt_dp_ag_group
+
+    # Verify both AG groups are set
+    assert pg_collection.dp_cp_ag is not None
+    assert pg_collection.expt_dp_ag is not None
+
+    # Verify expert AG group has same ranks as expert dp group
+    expt_dp_group = pg_collection.expt_dp
+    if expt_dp_group is not None:
+        expt_ag_ranks = torch.distributed.get_process_group_ranks(expt_dp_ag_group)
+        expt_dp_ranks_actual = torch.distributed.get_process_group_ranks(expt_dp_group)
+        assert (
+            expt_ag_ranks == expt_dp_ranks_actual
+        ), "Expert AG group should have same ranks as expert dp group"
+        assert (
+            expt_dp_ag_group != expt_dp_group
+        ), "Expert AG group should be a different communicator"
+
+    Utils.destroy_model_parallel()
+
+
+def test_process_group_collection_defaults():
+    """Test that ProcessGroupCollection initializes AG groups to None by default."""
+    # Initialize model parallel
+    Utils.initialize_model_parallel(context_parallel_size=world_size)
+
+    # Create ProcessGroupCollection without setting AG groups
+    pg_collection = ProcessGroupCollection.use_mpu_process_groups()
+
+    # AG groups should be None by default (users must create them explicitly)
+    assert hasattr(pg_collection, 'dp_cp_ag')
+    assert hasattr(pg_collection, 'expt_dp_ag')
+    assert pg_collection.dp_cp_ag is None, "dp_cp_ag should default to None"
+    assert pg_collection.expt_dp_ag is None, "expt_dp_ag should default to None"
+
+    # Regular groups should still work
+    assert pg_collection.dp is not None
+    assert pg_collection.dp_cp is not None
 
     Utils.destroy_model_parallel()

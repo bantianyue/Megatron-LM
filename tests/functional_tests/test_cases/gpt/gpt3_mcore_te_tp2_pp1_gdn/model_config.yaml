@@ -20,6 +20,7 @@ MODEL_ARGS:
   --apply-wd-to-qk-layernorm: true
   --attention-output-gate: true
   --experimental-attention-variant: gated_delta_net
+  --gdn-kernel-backend: torch
   --linear-attention-freq: 3
   --linear-conv-kernel-dim: 4
   --linear-key-head-dim: 64
@@ -50,9 +51,9 @@ MODEL_ARGS:
   --lr-decay-iters: 320000
   --save: ${CHECKPOINT_SAVE_PATH}
   --load: ${CHECKPOINT_LOAD_PATH}
-  --data-path: ${DATA_PATH}/text/the_pile/shard00/my-gpt3_00_text_document
-  --vocab-file: ${DATA_PATH}/text/the_pile/shard00/bpe/vocab.json
-  --merge-file: ${DATA_PATH}/text/the_pile/shard00/bpe/merges.txt
+  --data-path: ${DATA_PATH}/text/common_pile/v01_filtered_data/my-gpt3_00_text_document
+  --vocab-file: ${DATA_PATH}/text/common_pile/v01_filtered_data/bpe/vocab.json
+  --merge-file: ${DATA_PATH}/text/common_pile/v01_filtered_data/bpe/merges.txt
   --split: 949,50,1
   --distributed-backend: nccl
   --lr: 0.00015
@@ -80,3 +81,4 @@ MODEL_ARGS:
   --attention-backend: unfused
   --log-memory-to-tensorboard: true
 TEST_TYPE: ckpt-resume
+LAUNCHER: ft_launcher

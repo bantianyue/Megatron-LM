@@ -1,13 +1,156 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
+import contextlib
+import logging
 import multiprocessing
 import sys
+from importlib.metadata import PackageNotFoundError, version
+from typing import Any
 
 import torch
 
-from megatron.core.transformer.moe.moe_layer import MoELayer
-from megatron.core.utils import get_model_config
+from megatron.core.utils import accepts_parameter, get_model_config
+
+try:
+    FLASHINFER_JIT_CACHE_VERSION = version("flashinfer-jit-cache")
+except PackageNotFoundError:
+    FLASHINFER_JIT_CACHE_VERSION = None
+
+
+def detokenize_tokens(
+    tokenizer: Any, tokens: list[int], remove_EOD: bool = True, skip_special_tokens: bool = True
+) -> str:
+    """Convert token IDs to text using the inference detokenization policy.
+
+    Args:
+        tokenizer: Tokenizer that supplies ``detokenize`` and optionally ``eod``.
+        tokens: Token IDs to detokenize.
+        remove_EOD: Remove trailing end-of-sequence tokens before detokenization: every id in
+            ``model_eos_token_ids``, which also stops generation.
+        skip_special_tokens: Pass special-token removal through when supported.
+
+    Returns:
+        The decoded text.
+    """
+    if not tokens:
+        return ""
+
+    if remove_EOD:
+        eos_token_ids = model_eos_token_ids(tokenizer)
+        while tokens and tokens[-1] in eos_token_ids:
+            tokens = tokens[:-1]
+    if not tokens:
+        return ""
+
+    if accepts_parameter(tokenizer.detokenize, "skip_special_tokens"):
+        return tokenizer.detokenize(tokens, skip_special_tokens=skip_special_tokens)
+    return tokenizer.detokenize(tokens)
+
+
+def get_language_model(model: torch.nn.Module) -> torch.nn.Module:
+    """Return the language model: the one a multimodal wrapper holds, or the model itself.
+
+    Multimodal wrappers (e.g. LLaVAModel) keep the language model under ``language_model``.
+    Inference code that reads language-model state (vocab size, MTP block, embedding) resolves
+    it here rather than checking for a specific wrapper class.
+    """
+    language_model = getattr(model, "language_model", None)
+    return model if language_model is None else language_model
+
+
+def model_eos_token_ids(tokenizer: Any) -> frozenset:
+    """Return the model-level EOS token IDs.
+
+    Honors `generation_config.eos_token_id` (which HF may declare as a LIST, e.g.
+    `[2, 11]`) in addition to the tokenizer's single `eod`. The generation_config is
+    read off the tokenizer if present (HF tokenizers attach it; other tokenizers
+    won't).
+    """
+    ids = set()
+    eod = getattr(tokenizer, "eod", None)
+    if eod is not None:
+        ids.add(int(eod))
+    gen_cfg = getattr(tokenizer, "generation_config", None)
+    if isinstance(gen_cfg, dict):
+        eos = gen_cfg.get("eos_token_id")
+        if isinstance(eos, int) and not isinstance(eos, bool):
+            ids.add(eos)
+        elif isinstance(eos, (list, tuple)):
+            ids.update(int(e) for e in eos if isinstance(e, int) and not isinstance(e, bool))
+    return frozenset(ids)
+
+
+class InferenceMode:
+    """Process-wide flag indicating whether an inference engine is currently using the model.
+
+    Modules that need to distinguish between inference and non-inference (e.g. training,
+    RL logprobs) paths should read `InferenceMode.is_active()` rather than relying on
+    `self.training`, `torch.is_grad_enabled()`, or `inference_context is not None`.
+    """
+
+    _is_active: bool = False
+    _use_bounded_mxfp8_rows: bool = False
+
+    @classmethod
+    def is_active(cls) -> bool:
+        """Return True while an inference engine is currently using the model."""
+        return cls._is_active
+
+    @classmethod
+    def set_active(cls) -> None:
+        """Mark the inference engine active and reset its phase to the safe default."""
+        cls._is_active = True
+        cls._use_bounded_mxfp8_rows = False
+
+    @classmethod
+    def set_bounded_mxfp8_rows(cls, enabled: bool) -> None:
+        """Select bounded FlashInfer MXFP8 rows for the current inference step."""
+        cls._use_bounded_mxfp8_rows = enabled
+
+    @classmethod
+    def use_bounded_mxfp8_rows(cls) -> bool:
+        """Return whether the current step may use the configured bounded row prefix."""
+        return cls._use_bounded_mxfp8_rows
+
+    @classmethod
+    def unset_active(cls) -> None:
+        """Mark the inference engine as inactive. Idempotent."""
+        cls._is_active = False
+        cls._use_bounded_mxfp8_rows = False
+
+    @classmethod
+    @contextlib.contextmanager
+    def active(cls):
+        """Context manager: set the flag for the duration of the `with` block."""
+        cls.set_active()
+        try:
+            yield
+        finally:
+            cls.unset_active()
+
+
+def device_memory_summary() -> str:
+    """One-line GPU memory summary for torch_memory_saver logging."""
+    dev = torch.cuda.current_device()
+    stats = torch.cuda.memory_stats(dev)
+    try:
+        segs = torch.cuda.memory_snapshot(include_traces=False)
+    except TypeError:  # include_traces was added in PyTorch 2.11
+        segs = torch.cuda.memory_snapshot()
+    M = 1024**2
+    private = sum(
+        s.get("active_size", 0)
+        for s in segs
+        if s.get("device", dev) == dev and tuple(s.get("segment_pool_id", (0, 0))) != (0, 0)
+    )
+    alloc = stats.get("allocated_bytes.all.current", 0)
+    resv = stats.get("reserved_bytes.all.current", 0)
+    dev_mem = torch.cuda.device_memory_used()
+    return (
+        f"alloc={alloc/M:.0f}MiB private={private/M:.0f}MiB "
+        f"resv-alloc={(resv-alloc)/M:.0f}MiB resv={resv/M:.0f}MiB dev_mem={dev_mem/M:.0f}MiB"
+    )
 
 
 class Counter:
@@ -43,12 +186,15 @@ def get_attention_mask(seq_length: int) -> torch.Tensor:
 
 # Initialize cache for sequence parallel modules
 moe_layer_cache = None
+_moe_metadata_sync_initialized = False
 
 
 def _init_moe_expert_cache(model):
     """
     Initialize the cache of MoE layers once
     """
+    from megatron.core.transformer.moe.moe_layer import MoELayer
+
     global moe_layer_cache
     if moe_layer_cache is not None:
         return  # already initialized
@@ -68,6 +214,25 @@ def _init_moe_expert_cache(model):
             walk(child)
 
     walk(model)
+
+
+def set_moe_metadata_sync(model) -> None:
+    """Set _runs_metadata_sync on inference dispatchers.
+
+    Exactly one dispatcher per model — the first MoE layer — fires update_metadata
+    each step. All subsequent layers skip it to avoid redundant collective calls.
+    Must be called once after the model is built and put into eval mode.
+    """
+    global moe_layer_cache, _moe_metadata_sync_initialized
+    if _moe_metadata_sync_initialized:
+        return
+    if moe_layer_cache is None:
+        _init_moe_expert_cache(model)
+    for i, moe_layer in enumerate(moe_layer_cache):
+        dispatcher = getattr(moe_layer, '_inference_token_dispatcher', None)
+        if dispatcher is not None:
+            dispatcher._runs_metadata_sync = i == 0
+    _moe_metadata_sync_initialized = True
 
 
 def set_decode_expert_padding(model, set_to: bool = False, capacity_factor: int = None):
@@ -130,6 +295,45 @@ def set_decode_expert_padding(model, set_to: bool = False, capacity_factor: int 
         if hasattr(router, "config"):
             router.config.moe_expert_capacity_factor = capacity_factor
             router.config.moe_pad_expert_input_to_capacity = bool(set_to)
+
+
+def check_flashinfer_jit_cache_installed(log_version: bool = False):
+    """Verify that the flashinfer-jit-cache package is installed.
+
+    The flashinfer-jit-cache package provides pre-compiled CUTLASS fused MoE kernels
+    so they don't need to be JIT-compiled at runtime. This avoids a multi-minute
+    compilation step during CUDA graph warmup.
+
+    Raises:
+        RuntimeError: If flashinfer-jit-cache is not installed and CUDA version is 12 or 13.
+    """
+    if FLASHINFER_JIT_CACHE_VERSION is not None:
+        if log_version:
+            logging.info(
+                f"Found flashinfer-jit-cache {FLASHINFER_JIT_CACHE_VERSION} with "
+                "pre-compiled CUTLASS kernels."
+            )
+        return
+
+    cuda_major = torch.version.cuda.split(".")[0] if torch.version.cuda else None
+
+    if cuda_major == "12":
+        install_cmd = (
+            "Install it with:\n\npip install flashinfer-jit-cache "
+            "--index-url https://flashinfer.ai/whl/cu129\n"
+        )
+    elif cuda_major == "13":
+        install_cmd = (
+            "Install it with:\n\npip install flashinfer-jit-cache "
+            "--index-url https://flashinfer.ai/whl/cu130\n"
+        )
+    else:
+        install_cmd = ""
+
+    raise RuntimeError(
+        "The 'flashinfer-jit-cache' package is required for expert parallel inference "
+        f"but is not installed. {install_cmd}"
+    )
 
 
 def tensor_swap(x, src_idxs, dst_idxs):

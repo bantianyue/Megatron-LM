@@ -7,14 +7,12 @@ class ModelType(enum.Enum):
     """Model type."""
 
     encoder_or_decoder = 1
-
-    @property
-    def encoder_and_decoder(self):
-        """Deprecated property - use encoder_or_decoder instead."""
-        raise ValueError(
-            "ModelType.encoder_and_decoder is deprecated. Please use ModelType.encoder_or_decoder "
-            "instead."
-        )
+    # Retained so checkpoints written before the encoder/decoder model-type
+    # cleanup can still be deserialized. New models should use
+    # ``encoder_or_decoder``.
+    encoder_and_decoder = 2
+    retro_encoder = 3
+    retro_decoder = 4
 
 
 class Fp8Recipe(str, enum.Enum):

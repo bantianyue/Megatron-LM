@@ -8,7 +8,7 @@ import pytest
 import torch
 
 from megatron.core import parallel_state
-from megatron.core.extensions.transformer_engine import TEDotProductAttention
+from megatron.core.extensions.transformer_engine import HAVE_TE
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.quantization.quant_config import RecipeConfig
 from megatron.core.quantization.utils import get_quant_config_or_none
@@ -33,30 +33,35 @@ except ImportError:
     KitchenDotProductAttention = MagicMock()
     KitchenFlashAttention = MagicMock()
 
-try:
-    import transformer_engine  # type: ignore[import-untyped]
+if HAVE_TE:
     from transformer_engine.pytorch.attention import (  # type: ignore[import-untyped]
         dot_product_attention,
     )
 
-    HAVE_TE = True
-except ImportError:
+    from megatron.core.extensions.transformer_engine import TEDotProductAttention
+else:
     from unittest.mock import MagicMock
 
-    HAVE_TE = False
-    transformer_engine = MagicMock()
+    TEDotProductAttention = MagicMock()
     dot_product_attention = MagicMock()
 
 
-# Create custom process groups
-Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
-model_parallel_cuda_manual_seed(123)
+pg_collection = None
 
-# Get TP and CP process groups from device mesh
-tp_group = parallel_state.get_tensor_model_parallel_group()
-cp_group = parallel_state.get_context_parallel_group()
 
-pg_collection = ProcessGroupCollection(tp=tp_group, cp=cp_group)
+@pytest.fixture(scope="module", autouse=True)
+def model_parallel_groups():
+    """Create the TP and CP groups for this module's tests, and only when they run."""
+    global pg_collection
+    Utils.initialize_model_parallel(tensor_model_parallel_size=1, context_parallel_size=1)
+    model_parallel_cuda_manual_seed(123)
+    pg_collection = ProcessGroupCollection(
+        tp=parallel_state.get_tensor_model_parallel_group(),
+        cp=parallel_state.get_context_parallel_group(),
+    )
+    yield
+    pg_collection = None
+    Utils.destroy_model_parallel()
 
 
 def get_attention_implementation(

@@ -84,9 +84,8 @@ def test_grpo_training_loop(
     with open(model_config_path, 'r') as f:
         model_config = yaml.safe_load(f)
         metrics = model_config["METRICS"]
-        if "THROUGHPUT_TEST_PARAMS" in model_config:
-            throughput_test_params = model_config["THROUGHPUT_TEST_PARAMS"]
-            start_step = throughput_test_params["--start_step"]
+        if "ENV_VARS" in model_config and "THROUGHPUT_START_STEP" in model_config["ENV_VARS"]:
+            start_step = model_config["ENV_VARS"]["THROUGHPUT_START_STEP"]
         else:
             start_step = 1
 
@@ -133,9 +132,9 @@ def test_grpo_training_loop(
         lower_bound = (1 - ITERATION_TIME_RELATIVE_TOLERANCE) * iteration_time_golden
         upper_bound = (1 + ITERATION_TIME_RELATIVE_TOLERANCE) * iteration_time_golden
         assert lower_bound <= iteration_time_sampled <= upper_bound, (
-            f"Iteration time {iteration_time_sampled} ms not within "
-            f"{ITERATION_TIME_RELATIVE_TOLERANCE:.0%} of golden value ~{iteration_time_golden} ms. "
-            f"Sampled: {output_current['iteration-time']} ms. "
+            f"Iteration time {iteration_time_sampled} s not within "
+            f"{ITERATION_TIME_RELATIVE_TOLERANCE:.0%} of golden value ~{iteration_time_golden} s. "
+            f"Sampled: {output_current['iteration-time']} s. "
             f"Please update golden values in the functional tests if this is expected."
         )
 

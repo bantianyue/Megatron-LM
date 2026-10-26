@@ -1,9 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import abc
-import math
-import warnings
-from typing import Any, Dict, Iterable, Optional, Union
+from typing import Any, ClassVar, Dict, Iterable, Optional, Union
 
 import torch
 
@@ -14,104 +12,90 @@ from megatron.core.inference.communication_utils import (
     recv_from_prev_pipeline_rank_,
     send_to_next_pipeline_rank,
 )
+from megatron.core.inference.config import MultimodalPromptConfig
 from megatron.core.inference.contexts import BaseInferenceContext
-from megatron.core.inference.model_inference_wrappers.inference_wrapper_config import (
-    InferenceWrapperConfig,
-)
 from megatron.core.models.gpt.gpt_model import GPTModel
 from megatron.core.process_groups_config import ProcessGroupCollection
-from megatron.core.utils import get_attr_wrapped_model, get_model_config
+from megatron.core.utils import deprecate_args, get_attr_wrapped_model, get_model_config
+
+DEPRECATED_ARGS = ["inference_wrapper_config", "pg_collection"]
 
 
-# pylint: disable=line-too-long
 class AbstractModelInferenceWrapper(abc.ABC):
     """Abstract inference wrapper
 
     Extend this to create a version for your model.
 
-    The wrapper prepares the model for inference, provides the required input data and runs the forward pass.
+    The wrapper prepares the model for inference, provides the required input data and
+    runs the forward pass.
 
     Args:
         model (Union[GPTModel, LegacyGPTModel]): The actual GPT model (MCore
             or MLM).
-        inference_wrapper_config (InferenceWrapperConfig): Has info like
-            hidden size, vocab size etc.
         inference_context (BaseInferenceContext): Context for managing KV
             cache and other inference params.
-        pg_collection (ProcessGroupCollection): Process groups for model communication.
     """
 
+    # Input modalities accepted by this wrapper.
+    supports_text: ClassVar[bool] = True
+    supports_image: ClassVar[bool] = False
+    supports_video: ClassVar[bool] = False
+    supports_audio: ClassVar[bool] = False
+    multimodal_prompt_config: ClassVar[Optional[MultimodalPromptConfig]] = None
+
+    @deprecate_args(*DEPRECATED_ARGS)
     def __init__(
         self,
         model: Union['LegacyGPTModel', GPTModel],  # type: ignore[name-defined]
-        inference_wrapper_config: InferenceWrapperConfig,
-        inference_context: Optional[BaseInferenceContext] = None,
-        pg_collection: Optional[ProcessGroupCollection] = None,
+        inference_context: BaseInferenceContext,
     ):
         assert not isinstance(
             model, Iterable
         ), 'interleaving schedule is not supported for inference'
         self.model = model
-        self.inference_wrapper_config = inference_wrapper_config
+        self.config = get_model_config(self.model)
         self.pipeline_communication_dtype = (
-            torch.float
-            if self.inference_wrapper_config.fp32_residual_connection
-            else self.inference_wrapper_config.params_dtype
+            torch.float if self.config.fp32_residual_connection else self.config.params_dtype
         )
-        model_config = get_model_config(self.model)
-        self.sequence_parallel = model_config.sequence_parallel
-
-        if inference_context is None:
-            warnings.warn(
-                "`inference_context` must be passed in as an argument starting in `megatron-core` 0.13."
-            )
-            from megatron.core.inference.contexts import StaticInferenceContext
-
-            inference_context = StaticInferenceContext.from_config(inference_wrapper_config)
+        self.sequence_parallel = self.config.sequence_parallel
 
         self.inference_context = inference_context
+        configured_prompt_contract = getattr(
+            self.inference_context.config, "multimodal_prompt_config", None
+        )
+        if configured_prompt_contract is not None:
+            self.multimodal_prompt_config = configured_prompt_contract
 
-        if pg_collection is None:
+        # Get the inference pg_collection from the config if it exists; otherwise the training
+        # pg_collection might be used during RL
+        if (pg_collection := self.inference_context.config.pg_collection) is None:
             pg_collection = ProcessGroupCollection.use_mpu_process_groups()
 
         self.tp_group = pg_collection.tp
         self.pp_group = pg_collection.pp
         self.tp_size = torch.distributed.get_world_size(self.tp_group)
 
-        if self.inference_wrapper_config.fp8 is not None:
+        if (
+            getattr(self.config, "enable_mhc_connections", False)
+            and torch.distributed.get_world_size(self.pp_group) > 1
+        ):
+            raise NotImplementedError(
+                "mHC inference with pipeline parallelism is not supported: receive buffers "
+                "do not account for the expanded residual streams."
+            )
+
+        if self.config.fp8 is not None and self.config.transformer_impl != "inference_optimized":
             self.model = prepare_model_for_fp8_inference(self.model)
 
-    @property
-    def inference_params(self):
-        """Getter for deprecated `inference_params`."""
-        warnings.warn(
-            "`inference_params` renamed to `inference_context`, and will be removed in `megatron-core` 0.13."
-        )
-        return self.inference_context
+        # TODO(ksanthanam): Add support for fp4
 
-    @inference_params.setter
-    def inference_params(self, value):
-        """Setter for deprecated `inference_params`."""
-        warnings.warn(
-            "`inference_params` renamed to `inference_context`, and will be removed in `megatron-core` 0.13."
-        )
-        self.inference_context = value
-
-    def prep_model_for_inference(self, prompts_tokens: Optional[torch.Tensor] = None):
+    def prep_model_for_inference(self):
         """A utility function for preparing model for inference
 
         The function gets called once before the auto regressive inference loop.
         It puts the model in eval mode.
 
-        Args:
-            prompts_tokens (torch.Tensor, optional): Deprecated, will be removed in `megatron-core` 0.13
         """
-        if prompts_tokens is not None:
-            warnings.warn(
-                "Passing `prompts_tokens` is deprecated and this argument will be ignored."
-                "This parameter will be removed in `megatron-core` 0.13."
-            )
-
         self.model.eval()
 
         # For TP only model both is_pp_first_stage and _is_pp_last_stage returns True
@@ -120,6 +104,95 @@ class AbstractModelInferenceWrapper(abc.ABC):
         )
 
         self.inference_context.reset()
+
+    def validate_input_modalities(self, *modalities: str) -> None:
+        """Reject input modalities that this wrapper does not support."""
+        capabilities = {
+            "text": self.supports_text,
+            "image": self.supports_image,
+            "video": self.supports_video,
+            "audio": self.supports_audio,
+        }
+        for modality in modalities:
+            if modality not in capabilities:
+                raise ValueError(f"Unknown input modality: {modality!r}.")
+            if not capabilities[modality]:
+                raise ValueError(f"{type(self).__name__} does not support {modality} inputs.")
+
+    def resolve_media_token_id(self, tokenizer, modality: str) -> int:
+        """Resolve a compact media marker to one nonnegative tokenizer ID."""
+        prompt_config = self.multimodal_prompt_config
+        if prompt_config is None:
+            raise ValueError(f"{type(self).__name__} does not define a multimodal prompt contract.")
+        spec = prompt_config.get_spec(modality)
+        if not spec.model_token:
+            raise ValueError(
+                f"{type(self).__name__} does not define a model token for {modality} inputs."
+            )
+
+        candidates = [
+            getattr(getattr(tokenizer, "_tokenizer", None), "tokenizer", None),
+            getattr(tokenizer, "_tokenizer", None),
+            getattr(tokenizer, "tokenizer", None),
+            tokenizer,
+        ]
+        for candidate in candidates:
+            if candidate is None:
+                continue
+            resolved_id = None
+            if hasattr(candidate, "convert_tokens_to_ids"):
+                try:
+                    resolved_id = candidate.convert_tokens_to_ids(spec.model_token)
+                except (TypeError, ValueError):
+                    resolved_id = candidate.convert_tokens_to_ids([spec.model_token])
+                if isinstance(resolved_id, (list, tuple)):
+                    resolved_id = resolved_id[0] if len(resolved_id) == 1 else None
+                if resolved_id == getattr(candidate, "unk_token_id", None):
+                    resolved_id = None
+            if resolved_id is None and hasattr(candidate, "encode"):
+                try:
+                    encoded = candidate.encode(spec.model_token, add_special_tokens=False)
+                except TypeError:
+                    encoded = candidate.encode(spec.model_token)
+                if torch.is_tensor(encoded):
+                    encoded = encoded.reshape(-1).tolist()
+                if isinstance(encoded, (list, tuple)) and len(encoded) == 1:
+                    resolved_id = encoded[0]
+            if resolved_id is None and hasattr(candidate, "tokenize"):
+                encoded = candidate.tokenize(spec.model_token)
+                if torch.is_tensor(encoded):
+                    encoded = encoded.reshape(-1).tolist()
+                if isinstance(encoded, (list, tuple)) and len(encoded) == 1:
+                    resolved_id = encoded[0]
+            try:
+                resolved_id = int(resolved_id) if resolved_id is not None else None
+            except (TypeError, ValueError):
+                resolved_id = None
+            if resolved_id is not None and resolved_id >= 0:
+                return resolved_id
+
+        raise ValueError(
+            f"Tokenizer does not define {spec.model_token!r} as one nonnegative token."
+        )
+
+    def get_preexpanded_media_token_id(self, modality: str) -> int:
+        """Return the model-internal marker used by already-expanded prompts."""
+        raise NotImplementedError(
+            f"{type(self).__name__} must define its pre-expanded {modality} token id."
+        )
+
+    def build_preexpanded_media_token_mask(
+        self, prompt_tokens: torch.Tensor, modality: str
+    ) -> torch.Tensor:
+        """Map pre-expanded media-token positions to sequential embedding indices."""
+        media_token_id = self.get_preexpanded_media_token_id(modality)
+        media_positions = prompt_tokens == int(media_token_id)
+        media_indices = torch.nonzero(media_positions, as_tuple=False).flatten()
+        mask = torch.full_like(prompt_tokens, -1, dtype=torch.int64)
+        mask[media_indices] = torch.arange(
+            media_indices.numel(), dtype=torch.int64, device=prompt_tokens.device
+        )
+        return mask
 
     @abc.abstractmethod
     def prep_inference_input(self, prompt_tokens) -> Dict[str, Any]:
@@ -137,7 +210,9 @@ class AbstractModelInferenceWrapper(abc.ABC):
     def get_batch_for_context_window(self, *args, **kwargs) -> Dict[str, Any]:
         """Returns the input data for inference
 
-        This function gets called iteratively in the inference loop . It can be used to extract relevant input from the prompt tokens, attention mask etc. required for each step in inference.
+        This function gets called iteratively in the inference loop.
+        It can be used to extract relevant input from the prompt tokens, attention mask etc.
+        required for each step in inference.
 
         """
         raise NotImplementedError()
@@ -162,36 +237,20 @@ class AbstractModelInferenceWrapper(abc.ABC):
             runtime_gather_output=True,  # Inference should always gather the logits
         )
 
-    @torch.no_grad()
-    def dummy_forward(self):
-        """Run a dummy forward pass through the model, with a single token.
-        Use-case: Used in EP on ranks which do not have any work, but are needed
-        for the all-to-all communication."""
-        # we use num_dummy_tokens equal to tensor model parallel size
-        # so that the dummy forward pass will work with sequence parallel
-        num_dummy_tokens = self.tp_size
-        tokens = torch.zeros(
-            (1, num_dummy_tokens), dtype=torch.long, device=torch.cuda.current_device()
-        )
-        position_ids = torch.zeros(
-            (1, num_dummy_tokens), dtype=torch.long, device=torch.cuda.current_device()
-        )
-        attention_mask = None
-        return self.model(tokens, position_ids, attention_mask)
-
     def _get_batch_size_and_seq_len(
         self, tokens: torch.Tensor, recv_buffer_seq_len: Optional[int] = None
     ):
         """
-        Returns the batch size and sequence length based on the tokens tensor and recv_buffer_seq_len.
+        Returns the batch size and sequence length based on the tokens tensor and
+        recv_buffer_seq_len.
 
         Args:
             tokens (torch.Tensor): The input tensor of shape (batch_size, seq_len).
             recv_buffer_seq_len (int, optional): An optional recv buffer sequence length.
 
         Returns:
-            tuple: A tuple (batch_size, seq_len), where batch_size is the first dimension of tokens
-                   and seq_len is either the second dimension or recv_buffer_seq_len.
+            tuple: A tuple (batch_size, seq_len), where batch_size is the first dimension of
+                tokens and seq_len is either the second dimension or recv_buffer_seq_len.
         """
         batch_size = tokens.shape[0]
         seq_len = recv_buffer_seq_len if recv_buffer_seq_len is not None else tokens.shape[1]
@@ -204,7 +263,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
             # sequence parallelism. Static batching does not support sequence parallelism
             # except for the MoE layers which is handled separately.
             seq_len = seq_len // self.tp_size
-        recv_size = (seq_len, batch_size, self.inference_wrapper_config.hidden_size)
+        recv_size = (seq_len, batch_size, self.config.hidden_size)
         return torch.empty(
             recv_size, dtype=self.pipeline_communication_dtype, device=torch.cuda.current_device()
         )
@@ -214,10 +273,12 @@ class AbstractModelInferenceWrapper(abc.ABC):
     ) -> torch.Tensor:
         """Utility to carry out simple forward pass for TP or no model parallel models
 
-        Runs a very simple forward pass for model. Used  in the case of models without any parallelism or only tensor parallelism.
+        Runs a very simple forward pass for model. Used  in the case of models without any
+        parallelism or only tensor parallelism.
 
         Args:
-            inference_input (Dict[str, Any]): A dict containg the inputs for the gpt model [tokens, position ids, attention mask]
+            inference_input (Dict[str, Any]): A dict containg the inputs for the gpt model
+                [tokens, position ids, attention mask]
 
         Returns:
             torch.Tensor: The output logits of shape [batch_size, seq_len, padded_vocab_size]
@@ -228,16 +289,18 @@ class AbstractModelInferenceWrapper(abc.ABC):
 
         return logits
 
-    def forward_pass_with_pipeline_parallel_small_input_batch(
+    def forward_pass_with_pipeline_parallel(
         self, inference_input: Dict[str, Any], recv_buffer_seq_len: Optional[int] = None
     ) -> torch.Tensor:
-        """Utility to carry out forward pass for PP models with very small inputs
+        """Utility to carry out forward pass for PP models
 
-        If a model is pipeline parallel, yet, the input global batch is very small, we compute a foward pass on the entire global batch, rather than splitting it up into micro batches and doing something more complex as in the forward_pass_with_pipeline_parallel_large_input_batch method
+        TODO: Add support for asynchronous microbatches
 
         Args:
-            inference_input (Dict[str, Any]): A dict containing the inputs for the gpt model [tokens, position ids, attention mask]
-            recv_buffer_seq_len (int): An optional sequence length for the pipeline parallel recv buffer.
+            inference_input (Dict[str, Any]): A dict containing the inputs for the gpt model
+                [tokens, position ids, attention mask]
+            recv_buffer_seq_len (int): An optional sequence length for the pipeline parallel
+                recv buffer.
 
         Returns:
             torch.Tensor: The output logits of shape [batch_size, seq_len, padded_vocab_size]
@@ -268,98 +331,8 @@ class AbstractModelInferenceWrapper(abc.ABC):
             logits = output_tensor
 
             # Explicitly cast logits to expected dtype
-            logits = logits.to(self.inference_wrapper_config.params_dtype)
+            logits = logits.to(self.config.params_dtype)
 
-        return logits
-
-    def forward_pass_with_pipeline_parallel_large_input_batch(
-        self, inference_input: Dict[str, Any], recv_buffer_seq_len=None
-    ) -> torch.Tensor:
-        """Utility to carry out forward pass PP models.
-
-        Runs the forward pass for models which are pipeline parallel.
-        This is more complex than forward_pass_with_pipeline_parallel_small_input_batch because
-        this splits the global batch into small micro batches and runs them through the model.
-
-        Args:
-            inference_input (Dict[str, Any]): A dict containg the inputs for the gpt model [tokens, position ids, attention mask]
-            recv_buffer_seq_len (int): An optional sequence length for the pipeline parallel recv buffer.
-
-        Returns:
-            torch.Tensor: The output logits of shape [batch_size, seq_len, padded_vocab_size]
-        """
-        tokens = inference_input["tokens"]
-        position_ids = inference_input["position_ids"]
-        attention_mask = inference_input["attention_mask"]
-        materialize_only_last_token_logits = (
-            self.inference_context.materialize_only_last_token_logits
-        )
-
-        micro_batch_size = max(
-            1,
-            self.inference_wrapper_config.inference_batch_times_seqlen_threshold // tokens.size(1),
-        )
-        batch_size, seq_len = self._get_batch_size_and_seq_len(tokens, recv_buffer_seq_len)
-        # Round up to account for the last partial micro batch if present
-        num_micro_batches = math.ceil(batch_size / micro_batch_size)
-
-        logits = None
-        # Preallocate memory for output logits.
-        if is_pipeline_last_stage(self.pp_group):
-            logits_seq_len = 1 if materialize_only_last_token_logits else seq_len
-            logits = torch.empty(
-                (batch_size, logits_seq_len, self.inference_wrapper_config.padded_vocab_size),
-                dtype=self.pipeline_communication_dtype,
-                device=torch.cuda.current_device(),
-            )
-
-        recv_buffer = None
-        if not is_pipeline_first_stage(self.pp_group):
-            recv_buffer = self._allocate_recv_buffer(micro_batch_size, seq_len)
-        for micro_batch_index in range(num_micro_batches):
-            start = micro_batch_index * micro_batch_size
-            end = min(start + micro_batch_size, batch_size)
-            tokens2use = tokens[start:end, ...]
-            position_ids2use = position_ids[start:end, ...]
-            current_micro_batch_size = end - start
-
-            # Need to change recv buffer shape for the last partial microbatch (if exists)
-            if current_micro_batch_size != micro_batch_size:
-                recv_buffer = self._allocate_recv_buffer(current_micro_batch_size, seq_len)
-
-            if not is_pipeline_first_stage(self.pp_group):
-                recv_from_prev_pipeline_rank_(recv_buffer, self.pp_group)
-
-            self.model.set_input_tensor(recv_buffer)
-
-            output_tensor = self._forward(
-                {
-                    "tokens": tokens2use,
-                    "position_ids": position_ids2use,
-                    "attention_mask": attention_mask,
-                    "inference_context": self.inference_context,
-                }
-            )
-
-            if not is_pipeline_last_stage(self.pp_group):
-                send_to_next_pipeline_rank(output_tensor, self.pp_group)
-
-            self.inference_context.batch_size_offset += current_micro_batch_size
-
-            if is_pipeline_last_stage(self.pp_group):
-                assert logits is not None
-                logits[start:end, ...] = output_tensor
-
-        # Explicitly cast logits to expected dtype
-        if is_pipeline_last_stage(self.pp_group):
-            assert logits is not None
-            logits = logits.to(self.inference_wrapper_config.params_dtype)
-
-        # Once done with all micro batches, we reset batch size offset and seq len offset
-        self.inference_context.increment_sequence_len_offset(seq_len)
-        self.inference_context.reset_batch_size_offset()
-
-        # NOTE: Only returns the logits on the last pipeline stage
         return logits
 
     @torch.inference_mode()
@@ -368,14 +341,18 @@ class AbstractModelInferenceWrapper(abc.ABC):
     ) -> torch.Tensor:
         """The forward pass of the model for inference
 
-        Appropriate utility is called for the forward pass depending on the type of model parallelism used
+        Appropriate utility is called for the forward pass depending on the type of model
+        parallelism used
 
         Args:
-            inference_input (Dict[str, Any]): A dict containing the inputs for the gpt model [tokens, position ids, attention mask]
-            recv_buffer_seq_len (int): An optional sequence length for the pipeline parallel recv buffer.
+            inference_input (Dict[str, Any]): A dict containing the inputs for the gpt model
+                [tokens, position ids, attention mask]
+            recv_buffer_seq_len (int): An optional sequence length for the pipeline parallel
+                recv buffer.
 
         Returns:
-            torch.Tensor: The output logits of shape [batch_size, seq_len, padded_vocab_size]. The logits are returned only in the last pipeline stage for PP models.
+            torch.Tensor: The output logits of shape [batch_size, seq_len, padded_vocab_size].
+            The logits are returned only in the last pipeline stage for PP models.
         """
         # Check if we are in a PP model
         if not (is_pipeline_first_stage(self.pp_group) and is_pipeline_last_stage(self.pp_group)):
@@ -383,19 +360,6 @@ class AbstractModelInferenceWrapper(abc.ABC):
             current_batch_size, seq_len = self._get_batch_size_and_seq_len(
                 tokens, recv_buffer_seq_len
             )
-            # If input batch is large, we need to split into micro batches and run the forward pass
-            if (
-                current_batch_size * seq_len
-                > self.inference_wrapper_config.inference_batch_times_seqlen_threshold
-                and self.inference_wrapper_config.inference_batch_times_seqlen_threshold != -1
-            ):
-                return self.forward_pass_with_pipeline_parallel_large_input_batch(
-                    inference_input, recv_buffer_seq_len
-                )
-            else:
-                # If input batch is very small we can do a simple forward pass on the entire global batch
-                return self.forward_pass_with_pipeline_parallel_small_input_batch(
-                    inference_input, recv_buffer_seq_len
-                )
+            return self.forward_pass_with_pipeline_parallel(inference_input, recv_buffer_seq_len)
         else:
             return self.forward_pass_without_pipeline_parallel(inference_input)

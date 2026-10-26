@@ -26,7 +26,7 @@ def _sentinel_builder(return_value, calls):
     return _builder
 
 
-def test_model_provider_switches_to_modelopt_builder(monkeypatch):
+def test_model_provider_switches_to_modelopt_builder(monkeypatch, run_config):
     """Ensure model_provider delegates to ModelOpt builder when enabled."""
     args = Namespace(record_memory_history=False, modelopt_enabled=True)
     modelopt_calls = []
@@ -39,7 +39,7 @@ def test_model_provider_switches_to_modelopt_builder(monkeypatch):
     monkeypatch.setattr(mp, "has_nvidia_modelopt", True)
     monkeypatch.setattr(mp, "get_args", lambda: args)
     monkeypatch.setattr(
-        mp, "modelopt_gpt_mamba_builder", _sentinel_builder(modelopt_result, modelopt_calls)
+        mp, "modelopt_gpt_hybrid_builder", _sentinel_builder(modelopt_result, modelopt_calls)
     )
 
     # original_builder should be ignored when ModelOpt is enabled.

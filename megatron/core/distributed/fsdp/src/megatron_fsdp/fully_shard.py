@@ -20,8 +20,11 @@ from typing import Callable, Optional, Sequence, Type
 import torch
 from torch.distributed import DeviceMesh
 from torch.distributed.device_mesh import init_device_mesh
+from torch.distributed.tensor import DTensor
 
+from .distributed_data_parallel_config import VALID_SHARDING_STRATEGIES
 from .megatron_fsdp import MegatronFSDP
+from .mixed_precision import MixedPrecisionPolicy
 from .uneven_dtensor import preprocess_state_dict_for_uneven_dtensor
 from .utils import FSDPDistributedIndex, create_updated_function_signature
 
@@ -77,27 +80,35 @@ def fully_shard_model(
     dp_outer_dim: Optional[str] = None,
     tp_dim: Optional[str] = None,
     hybrid_fsdp_group: Optional[torch.distributed.ProcessGroup] = None,
+    hybrid_fsdp_expt_group: Optional[torch.distributed.ProcessGroup] = None,
     expt_device_mesh: Optional[DeviceMesh] = None,
+    fsdp_group_ag: Optional[torch.distributed.ProcessGroup] = None,
+    expt_fsdp_group_ag: Optional[torch.distributed.ProcessGroup] = None,
     fsdp_unit_modules: Optional[Sequence[Type[torch.nn.Module]] | Sequence[str]] = None,
     zero_dp_strategy: str | int = 3,
+    expert_zero_dp_strategy: Optional[str | int] = None,
     outer_dp_sharding_strategy: str | int = 0,
     device: Optional[torch.device] = None,
     init_model_with_meta_device: bool = False,
-    grad_reduce_in_fp32: bool = False,
-    preserve_fp32_weights: bool = True,
+    mixed_precision_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(),
     overlap_grad_reduce: bool = True,
     overlap_param_gather: bool = True,
     sync_model_each_microbatch: bool = True,
     preproc_state_dict_for_dcp_ckpt: bool = True,
-    check_for_nan_in_grad: bool = True,
+    report_nan_in_param_grad: bool = False,
     average_in_collective: bool = False,
     disable_bucketing: bool = False,
     calculate_per_token_loss: bool = False,
     keep_fp8_transpose_cache: bool = False,
     nccl_ub: bool = False,
     fsdp_double_buffer: bool = False,
+    fsdp_db_use_persist_buf_on_alloc_fail: bool = False,
     disable_symmetric_registration: bool = False,
     enable_fine_grained_param_gather: bool = False,
+    use_decoupled_grad: bool = False,
+    cuda_graph_mode: bool = False,
+    maxpool_double_buffer: bool = False,
+    hfsdp_param_gather_overlap: bool = False,
 ) -> torch.nn.Module:
     """
     Fully-shard the model for Megatron-FSDP. This wraps the model in a MegatronFSDP
@@ -139,6 +150,17 @@ def fully_shard_model(
             Expert parallel device mesh object defining the topology for MoE distributed training.
             Utilizes the mesh dimension names specified by the *_dim arguments.
 
+        fsdp_group_ag (Optional[torch.distributed.ProcessGroup]):
+            Independent all-gather process group for overlapping all-gather and reduce-scatter
+            operations. When provided, enables AG/RS overlap optimization for regular (non-expert)
+            parameters. Users should create this group with the same ranks as the dp-cp group.
+            Defaults to None.
+
+        expt_fsdp_group_ag (Optional[torch.distributed.ProcessGroup]):
+            Independent all-gather process group for expert parameters in MoE models. When provided,
+            enables AG/RS overlap optimization for expert parameters. Users should create this group
+            with the same ranks as the expert data parallel group. Defaults to None.
+
         fsdp_unit_modules (Optional[Sequence[Type[torch.nn.Module]] | Sequence[str]]):
             List of (sub-)module classes or (sub-)module class import paths that are "units",
             which are torch.nn.Module(s) that are sharded and scheduled by Megatron-FSDP.
@@ -161,6 +183,13 @@ def fully_shard_model(
                 is conceptually similar to "ZeRO-3".
             Defaults to "optim_grads_params" / 3.
 
+        expert_zero_dp_strategy (Optional[str | int]):
+            Zero-redundancy sharding strategy applied to expert (MoE) parameters. Shares the
+            same semantics as zero_dp_strategy. When set, zero_dp_strategy only applies to
+            non-expert parameters, which allows the two parameter classes to trade DP-Shard
+            communication against memory separately. Defaults to None, which applies
+            zero_dp_strategy to every parameter.
+
         outer_dp_sharding_strategy (str | int):
             Sharding strategy for outer data parallel group in Hybrid Sharded Data Parallel (HSDP).
             Shares the same semantics as zero_dp_strategy, but only 'no_shard' / 0 (DP Replication)
@@ -179,11 +208,9 @@ def fully_shard_model(
             implementing a custom Module.reset_parameters() or Module._reset_parameters() method.
             Defaults to False.
 
-        grad_reduce_in_fp32 (bool):
-            Whether to perform gradient reduction in FP32. Defaults to False.
-
-        preserve_fp32_weights (bool):
-            Whether to preserve FP32 optimization weights. Defaults to True.
+        mixed_precision_policy (megatron_fsdp.MixedPrecisionPolicy):
+            Megatron-FSDP mixed-precision config that controls compute and communication precision.
+            Default values are defined in `megatron_fsdp.MixedPrecisionPolicy`.
 
         overlap_grad_reduce (bool):
             Whether to overlap gradient reduce-scatter (or all-reduce) with backward compute.
@@ -192,6 +219,10 @@ def fully_shard_model(
         overlap_param_gather (bool):
             Whether to overlap parameter all-gather with forward and backward compute.
             Defaults to True.
+
+        hfsdp_param_gather_overlap (bool):
+            Whether to pipeline HFSDP parameter all-gathers across DP-Outer and DP-Inner.
+            Defaults to False.
 
         sync_model_each_microbatch (bool): Whether to sync parameters and install gradients on
             each training step. When disabled, Megatron-FSDP will overlap reduce-scatter with
@@ -206,8 +237,9 @@ def fully_shard_model(
             for both the model and the optimizer.
             Defaults to True.
 
-        check_for_nan_in_grad (bool):
-            Whether to check for NaN values in gradients. Defaults to True.
+        report_nan_in_param_grad (bool):
+            Whether to precisely check for NaN values in gradients for every weight. Can
+            significantly degrade performance. Defaults to False.
 
         average_in_collective (bool):
             Whether to average gradients in collective communication. Defaults to False.
@@ -230,6 +262,10 @@ def fully_shard_model(
         fsdp_double_buffer (bool):
             Whether to use double buffer for FSDP. Defaults to False.
 
+        fsdp_db_use_persist_buf_on_alloc_fail (bool):
+            Whether to fall back to persistent buffer allocator when a bucket does not
+            fit FSDP double buffer size.
+
         disable_symmetric_registration (bool):
             Whether to disable symmetric (window) registration for NCCL UB registration.
             This option forces conventional (local) UB registration when nccl_ub is set.
@@ -240,6 +276,28 @@ def fully_shard_model(
             when using MXFP8 parameters with activation recomputation. Specifically, it
             unshards parameters per-Module instead of unsharding all sub-modules of an FSDP
             unit module simultaneously. Defaults to False.
+
+        use_decoupled_grad (bool):
+            If true, reduced gradients are installed into `Parameter.decoupled_grad` instead
+            of `Parameter.grad`. Defaults to False.
+
+        cuda_graph_mode (bool):
+            If true, Megatron-FSDP will practice CUDA graph-safe operations, such as
+            not dereferencing `param.grad` after the optimizer step to preserve references
+            for CUDA graph replay. Can affect memory utilization in some cases, such as
+            when the gradient shard is not a view of the Megatron-FSDP sharded gradient
+            buffer, so `FusedAdam(use_decoupled_grad=True) + use_decoupled_grad=True` or
+            setting `megatron_fsdp_main_params_dtype == megatron_fsdp_main_grads_dtype`
+            is recommended to avoid casting the gradient to the parameter precision and
+            creating a casted-copy of the gradient shard that cannot be dereferenced due
+            to replay. Defaults to False.
+
+        maxpool_double_buffer (bool):
+            Builds a double buffer maxpool that can be recycled across asymmetric / hybrid
+            FSDP units, instead of the symmetrical FixedPoolAllocator that requires exact
+            parity between FSDP units, when using fsdp_double_buffer=True. Enables NCCL
+            user buffer registration and CUDA graph replay for models with asymmetrical
+            FSDP units, such as models with hybrid architectures (e.g. Mamba and MoE).
 
     Returns:
         model (MegatronFSDP): The wrapped Megatron-FSDP model configured for FSDP.
@@ -264,26 +322,37 @@ def fully_shard_model(
 
     # Parse zero_dp_strategy and outer_dp_sharding_strategy.
     # TODO(@cspades): Integrate this Enum into MegatronFSDP.
-    if zero_dp_strategy == ShardingStrategy.NO_SHARD:
-        zero_dp_strategy = "no_shard"
-    elif zero_dp_strategy == ShardingStrategy.OPTIM:
-        zero_dp_strategy = "optim"
-    elif zero_dp_strategy == ShardingStrategy.OPTIM_GRADS:
-        zero_dp_strategy = "optim_grads"
-    elif zero_dp_strategy == ShardingStrategy.OPTIM_GRADS_PARAMS:
-        zero_dp_strategy = "optim_grads_params"
-    elif zero_dp_strategy in ["no_shard", "optim", "optim_grads", "optim_grads_params"]:
-        # Valid string sharding strategy.
-        pass
-    else:
-        # Invalid sharding strategy.
-        raise ValueError(
-            f"Invalid FSDP / Inner DP Sharding Strategy: {zero_dp_strategy}\n"
-            f"Valid Sharding Strategies: {ShardingStrategy.NO_SHARD}, "
-            f"{ShardingStrategy.OPTIM}, {ShardingStrategy.OPTIM_GRADS}, "
-            f"{ShardingStrategy.OPTIM_GRADS_PARAMS}, "
-            "no_shard, optim, optim_grads, optim_grads_params"
-        )
+    def _parse_zero_dp_strategy(strategy: ShardingStrategy | str | int) -> str:
+        if isinstance(strategy, str):
+            if strategy not in VALID_SHARDING_STRATEGIES:
+                raise ValueError(
+                    f"Invalid FSDP / Inner DP Sharding Strategy: {strategy}\n"
+                    f"Valid Sharding Strategies: {VALID_SHARDING_STRATEGIES}"
+                )
+            return strategy
+
+        # ShardingStrategy is an IntEnum, so the enum members also match the bare ints.
+        match strategy:
+            case ShardingStrategy.NO_SHARD:
+                return "no_shard"
+            case ShardingStrategy.OPTIM:
+                return "optim"
+            case ShardingStrategy.OPTIM_GRADS:
+                return "optim_grads"
+            case ShardingStrategy.OPTIM_GRADS_PARAMS:
+                return "optim_grads_params"
+            case _:
+                raise ValueError(
+                    f"Invalid FSDP / Inner DP Sharding Strategy: {strategy}\n"
+                    f"Valid Sharding Strategies: {ShardingStrategy.NO_SHARD}, "
+                    f"{ShardingStrategy.OPTIM}, {ShardingStrategy.OPTIM_GRADS}, "
+                    f"{ShardingStrategy.OPTIM_GRADS_PARAMS}, "
+                    f"{VALID_SHARDING_STRATEGIES}"
+                )
+
+    zero_dp_strategy = _parse_zero_dp_strategy(zero_dp_strategy)
+    if expert_zero_dp_strategy is not None:
+        expert_zero_dp_strategy = _parse_zero_dp_strategy(expert_zero_dp_strategy)
     if outer_dp_sharding_strategy == ShardingStrategy.NO_SHARD:
         outer_dp_sharding_strategy = "no_shard"
     elif outer_dp_sharding_strategy == ShardingStrategy.OPTIM:
@@ -301,14 +370,33 @@ def fully_shard_model(
 
     # Validate more arguments.
     _outer_fsdp_sharding = outer_dp_sharding_strategy == "optim"
-    if _outer_fsdp_sharding and zero_dp_strategy != "optim_grads_params":
-        # If sharding on outer DP using HSDP, then we must use HSDP buffers and
-        # we must be fully-sharding on inner DP. HSDP is an extension of FSDP.
-        # TODO(@shjwudp, @cspades): Requires various modifications to support.
+    _replicated_grad_strategies = sorted(
+        {
+            strategy
+            for strategy in (zero_dp_strategy, expert_zero_dp_strategy)
+            if strategy in ("no_shard", "optim")
+        }
+    )
+    if _outer_fsdp_sharding and _replicated_grad_strategies:
+        # Sharding the optimizer state over DP-Outer constrains how DP-Shard handles
+        # gradients, but deliberately not how it handles model weights.
+        #
+        # Gradients: the DP-Outer reduction reduce-scatters the gradient shard that the
+        # DP-Shard reduction produced, so DP-Shard has to shard gradients. Replicating them
+        # ('no_shard', 'optim') and reduce-scattering that over DP-Outer is well defined, but
+        # it needs an all-reduce-then-reduce-scatter path that does not exist here, and it
+        # would move the whole gradient over DP-Shard to reach the same placement that
+        # 'optim_grads' reaches with a reduce-scatter. Rejected rather than mis-scaled.
+        #
+        # Model weights: no equivalent constraint, which is the point of this configuration.
+        # A group whose weights are replicated reassembles the whole bucket from the DP-wide
+        # weight shards rather than viewing a DP-Shard slice of it, so ZeRO-1/ZeRO-2 inner
+        # sharding can sit under DP-Outer optimizer sharding instead of requiring ZeRO-3.
         raise ValueError(
-            f"Sharding with Hybrid (Fully) Sharded Data Parallel (HSDP) requires "
-            "zero_dp_strategy to use FSDP ('optim_grads_params', 3), because "
-            "outer sharding is dependent on inner sharding."
+            "Sharding with Hybrid (Fully) Sharded Data Parallel (HSDP) requires a "
+            "zero_dp_strategy that shards gradients ('optim_grads', 2 or "
+            f"'optim_grads_params', 3), but got {_replicated_grad_strategies}, because "
+            "outer sharding is dependent on inner gradient sharding."
         )
     if (dp_outer_dim is None) ^ (hybrid_fsdp_group is None):
         # XOR - HSDP requires both or neither of dp_outer_dim and hybrid_fsdp_group
@@ -326,17 +414,20 @@ def fully_shard_model(
     # DDP Config for Megatron FSDP.
     ddp_config = DistributedDataParallelConfig(
         data_parallel_sharding_strategy=zero_dp_strategy,
+        expert_data_parallel_sharding_strategy=expert_zero_dp_strategy,
         outer_dp_sharding_strategy=outer_dp_sharding_strategy,
-        grad_reduce_in_fp32=grad_reduce_in_fp32,
-        preserve_fp32_weights=preserve_fp32_weights,
         overlap_grad_reduce=overlap_grad_reduce,
         overlap_param_gather=overlap_param_gather,
+        hfsdp_param_gather_overlap=hfsdp_param_gather_overlap,
         average_in_collective=average_in_collective,
         keep_fp8_transpose_cache=keep_fp8_transpose_cache,  # pylint: disable=C0301
         nccl_ub=nccl_ub,
         fsdp_double_buffer=fsdp_double_buffer or nccl_ub,
+        fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
         disable_symmetric_registration=disable_symmetric_registration,
-        check_for_nan_in_grad=check_for_nan_in_grad,
+        megatron_fsdp_use_decoupled_grad=use_decoupled_grad,
+        megatron_fsdp_cuda_graph_mode=cuda_graph_mode,
+        megatron_fsdp_max_pool_double_buffer=maxpool_double_buffer,
     )
 
     # Create FSDPDistributedIndex.
@@ -352,10 +443,15 @@ def fully_shard_model(
         tp_dim=tp_dim,
         # Only required for HSDP.
         hybrid_fsdp_group=hybrid_fsdp_group,
+        # Only required for HSDP + EP.
+        hybrid_fsdp_expt_group=hybrid_fsdp_expt_group,
         # Access to flattened DP rank assignments for HSDP.
         hsdp_outer_dp_shard=_outer_fsdp_sharding,
         # Only required for Megatron-FSDP + EP.
         expt_device_mesh=expt_device_mesh,
+        # AG groups for AG/RS overlap optimization.
+        fsdp_group_ag=fsdp_group_ag,
+        expt_fsdp_group_ag=expt_fsdp_group_ag,
     )
 
     # Wrap model in Megatron FSDP.
@@ -363,6 +459,7 @@ def fully_shard_model(
         module=module,
         dist_index=dist_index,
         ddp_config=ddp_config,
+        mixed_precision_policy=mixed_precision_policy,
         fsdp_unit_modules=fsdp_unit_modules,
         disable_bucketing=disable_bucketing,
         device=device,
@@ -370,6 +467,7 @@ def fully_shard_model(
         init_model_with_meta_device=init_model_with_meta_device,
         sync_model_each_microbatch=sync_model_each_microbatch,
         enable_fine_grained_param_gather_hook=enable_fine_grained_param_gather,
+        report_nan_in_param_grad=report_nan_in_param_grad,
     )
 
     # Register a state dict post-hook to add Torch DCP metadata for writing checkpoints.
@@ -447,6 +545,64 @@ def fully_shard_optimizer(
     optimizer_step_base_func = type(optimizer).step
     optimizer_zero_grad_base_func = type(optimizer).zero_grad
 
+    # Materialize lazy optimizer state so DCP has state tensors to load into. This
+    # follows PyTorch DCP's `_init_optim_state`, which takes a synthetic zero-gradient
+    # step before loading optimizer state.
+    # TODO: Consider moving this initialization to the checkpoint-loading path, as in
+    # the MFSDP v2 checkpoint API (#6024), where checkpoint state immediately
+    # overwrites the synthetic state. Keeping it in fully_shard_optimizer() means that
+    # fresh training may follow, so this synthetic step must be numerically inert.
+    for group in optimizer.param_groups:
+        for param in group["params"]:
+            if param.numel() == 0 or (
+                hasattr(param, "_local_tensor") and param._local_tensor.numel() == 0
+            ):
+                # Avoid FusedAdam errors on empty tensor input.
+                continue
+            # Optimizer state is built from wgrad.
+            param.grad = torch.zeros_like(param)
+
+    # A zero gradient alone does not make optimizer.step() inert. Set lr to zero
+    # to prevent parameter updates. Also disable weight decay because optimizers
+    # with coupled decay add it to the gradient before updating their persistent
+    # moment buffers, independently of lr.
+    optimizer_group_settings = []
+    for group in optimizer.param_groups:
+        optimizer_group_settings.append(
+            (group, {key: group[key] for key in ("lr", "weight_decay") if key in group})
+        )
+        if "lr" in group:
+            # Capturable optimizers may require lr to remain a device tensor.
+            group["lr"] = (
+                torch.zeros_like(group["lr"]) if isinstance(group["lr"], torch.Tensor) else 0.0
+            )
+        if "weight_decay" in group:
+            group["weight_decay"] = 0.0
+    # Allocate the state, then restore the caller's optimizer settings.
+    optimizer.step()
+    for group, settings in optimizer_group_settings:
+        group.update(settings)
+
+    # Optimizers advance their step counters even when lr is zero. Reset them so
+    # the first real update uses step 1 for bias correction.
+    for group in optimizer.param_groups:
+        if "step" not in group:
+            continue
+        if isinstance(group["step"], torch.Tensor):
+            group["step"].zero_()
+        else:
+            group["step"] = 0
+    for state in optimizer.state.values():
+        if "step" not in state:
+            continue
+        if isinstance(state["step"], torch.Tensor):
+            state["step"].zero_()
+        else:
+            state["step"] = 0
+
+    # Remove the synthetic gradients installed above.
+    optimizer.zero_grad()
+
     # Define a new optimizer.step() method that distributes optimizer state and gradients,
     # waits for asynchronous gradient reduce-scatter work to be completed, and updates
     # model weights. These options can be turned off via arguments in optimizer.step().
@@ -500,19 +656,95 @@ def fully_shard_optimizer(
     optimizer.zero_grad = types.MethodType(megatron_fsdp_optimizer_zero_grad, optimizer)
 
     if preproc_state_dict_for_dcp_ckpt:
-        # Requires a non-empty, DTensor-type optimizer state dictionary.
-        # This is satisfied naturally by calling optimizer.state_dict()
-        # after the first optimizer.step() initializes the state to match
-        # the Megatron-FSDP
-        optimizer_state_dict = optimizer.state_dict()
+
+        def dict_nested_shallow_copy(d: dict):
+            """Create a nested shallow copy of a dict. Same values, different pointers."""
+            if not isinstance(d, dict):
+                return d
+            return {
+                k: dict_nested_shallow_copy(v) if isinstance(v, dict) else v for k, v in d.items()
+            }
+
+        def preprocess_optimizer_state_dict_for_uneven_dtensor(optimizer, state_dict):
+            """
+            Hook that mocks the global optimizer state for unevenly-distributed
+            DTensors, as the optimizer state is only initialized for non-empty
+            parameters, and preprocesses the optimizer `state_dict` DTensors
+            in-place for Torch DCP.
+            """
+            # Retrieve a template optimizer state.
+            optim_state_template = next(iter(optimizer.state.values())) if optimizer.state else {}
+            # All-gather the optimizer state keys as this rank could have empty state.
+            optim_state_dtensor_keys = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(
+                optim_state_dtensor_keys,
+                [
+                    # Only track keys associated with DTensors for DCP.
+                    key
+                    for key, val in optim_state_template.items()
+                    if isinstance(val, DTensor)
+                ],
+            )
+            optim_state_dtensor_keys = list(
+                set([key for state in optim_state_dtensor_keys for key in state])
+            )
+
+            # NOTE(@cspades): Re-construct the Megatron-FSDP distributed parameter
+            # to index mapping as implemented in torch.optim.Optimizer.state_dict():
+            # https://github.com/pytorch/pytorch/blob/main/torch/optim/optimizer.py
+            # Simply put, the index maps to the very first appearance of id(param)
+            # looping through all parameters in all groups with memory address
+            # equivalent to the distributed parameter managed by Megatron-FSDP.
+            param_state_idx = {}
+            idx = 0
+            # For all empty parameters, mock empty DTensors for all empty parameters
+            # of Megatron-FSDP's unevenly-distributed optimizer state into a shallow
+            # copy of the state dictionary to synchronize and pre-process a global
+            # variant of the optimizer state in preparation for Torch DCP. This allows
+            # us to sync the non-empty DTensor shard metadata across sharding groups
+            # while excluding empty DTensor shards from the optimizer checkpoint.
+            optim_state_extended = dict_nested_shallow_copy(state_dict)
+            for param_group in optimizer.param_groups:
+                for param in param_group["params"]:
+                    # Update the parameter state index.
+                    # For shared params, use same index.
+                    if id(param) not in param_state_idx:
+                        # New parameter, assign an index.
+                        param_state_idx[id(param)] = idx
+                        idx += 1
+                    if param in optimizer.state or not isinstance(param, DTensor):
+                        # Only mock optimizer state for parameters that are missing state.
+                        # No need to mock for non-DTensor params. Not relevant to DCP.
+                        continue
+                    for key in optim_state_dtensor_keys:
+                        # Construct a mock DTensor state for the empty DTensor parameter.
+                        param_idx = param_state_idx[id(param)]
+                        optim_state_extended["state"].setdefault(param_idx, {})[key] = (
+                            DTensor.from_local(
+                                local_tensor=torch.empty(0, dtype=param.dtype, device=param.device),
+                                device_mesh=param.device_mesh,
+                                placements=param.placements,
+                                shape=param.shape,
+                                stride=param.stride(),
+                            )
+                        )
+
+            # Synchronize and preprocess DTensor metadata for Torch DCP.
+            preprocess_state_dict_for_uneven_dtensor(optim_state_extended)
+
+        # Attach the optimizer state_dict() post-hook to prepare DTensors for Torch DCP.
+        # args = (optimizer, state_dict)
         optimizer.register_state_dict_post_hook(
-            lambda *args, **kwargs: preprocess_state_dict_for_uneven_dtensor(optimizer_state_dict)
+            lambda *args, **kwargs: preprocess_optimizer_state_dict_for_uneven_dtensor(
+                args[0], args[1]
+            )
         )
 
     # Return the in-place modified optimizer.
     return optimizer
 
 
+@experimental_api
 def fully_shard(
     module: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -521,27 +753,35 @@ def fully_shard(
     dp_outer_dim: Optional[str] = None,
     tp_dim: Optional[str] = None,
     hybrid_fsdp_group: Optional[torch.distributed.ProcessGroup] = None,
+    hybrid_fsdp_expt_group: Optional[torch.distributed.ProcessGroup] = None,
     expt_device_mesh: Optional[DeviceMesh] = None,
+    fsdp_group_ag: Optional[torch.distributed.ProcessGroup] = None,
+    expt_fsdp_group_ag: Optional[torch.distributed.ProcessGroup] = None,
     fsdp_unit_modules: Optional[Sequence[Type[torch.nn.Module]] | Sequence[str]] = None,
     zero_dp_strategy: str | int = 3,
+    expert_zero_dp_strategy: Optional[str | int] = None,
     outer_dp_sharding_strategy: str | int = 0,
     device: Optional[torch.device] = None,
     init_model_with_meta_device: bool = False,
-    grad_reduce_in_fp32: bool = False,
-    preserve_fp32_weights: bool = True,
+    mixed_precision_policy: MixedPrecisionPolicy = MixedPrecisionPolicy(),
     overlap_grad_reduce: bool = True,
     overlap_param_gather: bool = True,
     sync_model_each_microbatch: bool = True,
     preproc_state_dict_for_dcp_ckpt: bool = True,
-    check_for_nan_in_grad: bool = True,
+    report_nan_in_param_grad: bool = False,
     average_in_collective: bool = False,
     disable_bucketing: bool = False,
     calculate_per_token_loss: bool = False,
     keep_fp8_transpose_cache: bool = False,
     nccl_ub: bool = False,
     fsdp_double_buffer: bool = False,
+    fsdp_db_use_persist_buf_on_alloc_fail: bool = False,
     disable_symmetric_registration: bool = False,
     enable_fine_grained_param_gather: bool = False,
+    use_decoupled_grad: bool = False,
+    cuda_graph_mode: bool = False,
+    maxpool_double_buffer: bool = False,
+    hfsdp_param_gather_overlap: bool = False,
 ) -> tuple[MegatronFSDP, torch.optim.Optimizer]:
     """
     Fully shard the model and the optimizer for Megatron-FSDP.
@@ -568,27 +808,34 @@ def fully_shard(
         dp_outer_dim=dp_outer_dim,
         tp_dim=tp_dim,
         hybrid_fsdp_group=hybrid_fsdp_group,
+        hybrid_fsdp_expt_group=hybrid_fsdp_expt_group,
         expt_device_mesh=expt_device_mesh,
+        fsdp_group_ag=fsdp_group_ag,
+        expt_fsdp_group_ag=expt_fsdp_group_ag,
         fsdp_unit_modules=fsdp_unit_modules,
         zero_dp_strategy=zero_dp_strategy,
+        expert_zero_dp_strategy=expert_zero_dp_strategy,
         outer_dp_sharding_strategy=outer_dp_sharding_strategy,
         device=device,
         init_model_with_meta_device=init_model_with_meta_device,
-        grad_reduce_in_fp32=grad_reduce_in_fp32,
-        preserve_fp32_weights=preserve_fp32_weights,
+        mixed_precision_policy=mixed_precision_policy,
         overlap_grad_reduce=overlap_grad_reduce,
         overlap_param_gather=overlap_param_gather,
+        hfsdp_param_gather_overlap=hfsdp_param_gather_overlap,
         sync_model_each_microbatch=sync_model_each_microbatch,
         preproc_state_dict_for_dcp_ckpt=preproc_state_dict_for_dcp_ckpt,
-        check_for_nan_in_grad=check_for_nan_in_grad,
+        report_nan_in_param_grad=report_nan_in_param_grad,
         average_in_collective=average_in_collective,
         disable_bucketing=disable_bucketing,
         calculate_per_token_loss=calculate_per_token_loss,
         keep_fp8_transpose_cache=keep_fp8_transpose_cache,
         nccl_ub=nccl_ub,
         fsdp_double_buffer=fsdp_double_buffer,
+        fsdp_db_use_persist_buf_on_alloc_fail=fsdp_db_use_persist_buf_on_alloc_fail,
         disable_symmetric_registration=disable_symmetric_registration,
-        enable_fine_grained_param_gather=enable_fine_grained_param_gather,
+        use_decoupled_grad=use_decoupled_grad,
+        cuda_graph_mode=cuda_graph_mode,
+        maxpool_double_buffer=maxpool_double_buffer,
     )
 
     # Extend optimizer methods to support Megatron-FSDP operations.

@@ -1,7 +1,9 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+from __future__ import annotations
 
 import warnings
-from typing import Optional, Tuple
+from functools import partial
+from typing import Optional, cast
 
 from megatron.core.extensions.transformer_engine import (
     TEActivationOp,
@@ -15,15 +17,44 @@ from megatron.core.extensions.transformer_engine import (
     TERowParallelLinear,
 )
 from megatron.core.fusions.fused_layer_norm import FusedLayerNorm
-from megatron.core.models.backends import BackendSpecProvider
+from megatron.core.models.backends import (
+    BackendSpecProvider,
+    CrossEntropyTarget,
+    select_cross_entropy,
+)
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear, RowParallelLinear
-from megatron.core.transformer.mlp import MLPSubmodules
-from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
+from megatron.core.transformer.mlp import MLPSubmodules, TEActivationFunctionBuilder
+from megatron.core.transformer.moe.experts import GroupedMLPSubmodules, SequentialMLP, TEGroupedMLP
+from megatron.core.transformer.moe.moe_layer import ExpertsBuilder
+from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.utils import get_te_version, is_te_min_version
+
+
+class _TENormWithResidual:
+    """Class adapter for TENorm with residual fusion enabled."""
+
+    def __new__(cls, *args, **kwargs):
+        return TENorm(*args, has_residual=True, **kwargs)
 
 
 class TESpecProvider(BackendSpecProvider):
     """A protocol for providing the submodules used in Spec building."""
+
+    # Checked by require() when a caller needs an early refusal. Spec construction itself
+    # does not require TE, since several module-level specs are assembled at import time.
+    REQUIRES = "transformer_engine"
+
+    def __init__(
+        self,
+        use_te_op_fuser: bool = False,
+        cross_entropy_loss_fusion: bool = False,
+        cross_entropy_fusion_impl: str = "native",
+        cuda_graph_impl: Optional[str] = None,
+    ) -> None:
+        self._use_te_op_fuser = use_te_op_fuser
+        self._cross_entropy_loss_fusion = cross_entropy_loss_fusion
+        self._cross_entropy_fusion_impl = cross_entropy_fusion_impl
+        self._cuda_graph_impl = cuda_graph_impl
 
     def linear(self) -> type:
         """Which linear module TE backend uses"""
@@ -33,7 +64,7 @@ class TESpecProvider(BackendSpecProvider):
         """Which column parallel linear module TE backend uses"""
         return TEColumnParallelLinear
 
-    def row_parallel_linear(self) -> type:
+    def row_parallel_linear(self) -> type[TERowParallelLinear]:
         """Which row parallel linear module TE backend uses"""
         return TERowParallelLinear
 
@@ -45,37 +76,33 @@ class TESpecProvider(BackendSpecProvider):
         """Which module for sequential layernorm and linear"""
         return TELayerNormColumnParallelLinear
 
-    def layer_norm(self, rms_norm: bool = False, for_qk: bool = False) -> type:
+    def layer_norm(
+        self, rms_norm: bool = False, for_qk: bool = False, has_residual: bool = False
+    ) -> LayerNormBuilder:
         """Which module to use for layer norm"""
         if for_qk and not is_te_min_version("1.9.0"):
             # TENorm significantly harms convergence when used
             # for QKLayerNorm if TE Version < 1.9;
             # we instead use the Apex implementation.
             return FusedLayerNorm
-        return TENorm
+        # Keep returning a class so this path stays aligned with build_module's class handling.
+        return _TENormWithResidual if has_residual else TENorm
 
     def core_attention(self) -> type:
         """Which module to use for attention"""
         return TEDotProductAttention
 
-    def grouped_mlp_modules(
-        self, moe_use_grouped_gemm: bool, moe_use_legacy_grouped_gemm: bool
-    ) -> Tuple[type, Optional[MLPSubmodules]]:
+    def grouped_mlp_modules(self, moe_use_grouped_gemm: bool) -> ExpertsBuilder:
         """Which module and submodules to use for grouped mlp"""
-        if (
-            moe_use_grouped_gemm
-            and TEColumnParallelGroupedLinear is not None
-            and not moe_use_legacy_grouped_gemm
-        ):
-            return TEGroupedMLP, MLPSubmodules(
-                linear_fc1=TEColumnParallelGroupedLinear, linear_fc2=TERowParallelGroupedLinear
+        if moe_use_grouped_gemm and TEColumnParallelGroupedLinear is not None:
+            return partial(
+                TEGroupedMLP,
+                submodules=GroupedMLPSubmodules(
+                    linear_fc1=TEColumnParallelGroupedLinear,
+                    linear_fc2=TERowParallelGroupedLinear,
+                    activation_func=self.activation_func(),
+                ),
             )
-        elif moe_use_grouped_gemm:
-            warnings.warn(
-                'The legacy GroupedMLP will be deprecated in Megatron-Core v0.12.0. '
-                'Please update the TransformerEngine to version>=1.7.0 and use TEGroupedMLP.'
-            )
-            return GroupedMLP, None
         else:
             if not is_te_min_version("1.7.0.dev0"):
                 warnings.warn(
@@ -83,13 +110,57 @@ class TESpecProvider(BackendSpecProvider):
                     f"but your version is {get_te_version()}. "
                     "Use local linear implementation instead."
                 )
-                return SequentialMLP, MLPSubmodules(
-                    linear_fc1=ColumnParallelLinear, linear_fc2=RowParallelLinear
+                return partial(
+                    SequentialMLP,
+                    submodules=MLPSubmodules(
+                        linear_fc1=ColumnParallelLinear,
+                        linear_fc2=RowParallelLinear,
+                        activation_func=self.activation_func(),
+                    ),
                 )
-            return SequentialMLP, MLPSubmodules(
-                linear_fc1=TEColumnParallelLinear, linear_fc2=TERowParallelLinear
+            return partial(
+                SequentialMLP,
+                submodules=MLPSubmodules(
+                    linear_fc1=TEColumnParallelLinear,
+                    linear_fc2=TERowParallelLinear,
+                    activation_func=self.activation_func(),
+                ),
             )
 
-    def activation_func(self) -> type:
+    def activation_func(self) -> TEActivationFunctionBuilder | None:
         """Which module to use for activation function"""
-        return TEActivationOp
+        # transformer_engine.BasicOperation.forward has an overly permissive return type, but by
+        # design these classes always meet the interface.
+        return cast(TEActivationFunctionBuilder, TEActivationOp)
+
+    def mlp_module(self, grouped: bool = False) -> type:
+        """The dense MLP block, fused into TE operations when the fuser is on."""
+        if not self._use_te_op_fuser:
+            from megatron.core.transformer.mlp import MLP
+
+            return MLP
+        from megatron.core.extensions.transformer_engine import (
+            TEFusedMLP,
+            TEFusedMLPWithGroupedLinear,
+        )
+
+        target = TEFusedMLPWithGroupedLinear if grouped else TEFusedMLP
+        if target is None:
+            raise ImportError(
+                "Transformer Engine is installed but does not expose the operation-fused MLP."
+            )
+        return target
+
+    def moe_router(self) -> Optional[type]:
+        """Keep the MoESubmodules default."""
+        return None
+
+    def vocab_parallel_cross_entropy(self) -> CrossEntropyTarget:
+        """Which vocab-parallel cross entropy to use.
+
+        Which one depends on the config rather than on this being the TE provider, so the
+        same settings give the same kernel whichever backend supplies the rest of the model.
+        """
+        return select_cross_entropy(
+            self._cross_entropy_loss_fusion, self._cross_entropy_fusion_impl, self._cuda_graph_impl
+        )

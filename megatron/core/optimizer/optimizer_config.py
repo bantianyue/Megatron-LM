@@ -1,6 +1,7 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import fnmatch
+import math
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Tuple, Union
 
@@ -137,7 +138,7 @@ class ParamKey:
 
 @dataclass
 class OptimizerConfig:
-    """Base optimizer configuration object."""
+    """Configuration object for Megatron optimizers."""
 
     ##############
     # General
@@ -207,7 +208,8 @@ class OptimizerConfig:
     """dtype of exp_avg_sq when enabling precision-aware-optimizer"""
 
     optimizer: str = 'adam'
-    """Optimizer name. NOTE: Deprecated, use individual optimizer classes instead."""
+    """Optimizer name (e.g., 'adam', 'sgd', 'muon'). Can be overridden per-parameter group
+    via config_overrides to use different optimizers for different parameters."""
 
     ###############
     # Loss scaling
@@ -230,7 +232,7 @@ class OptimizerConfig:
     """Hysteresis for dynamic loss scaling."""
 
     ###################################################################################
-    # Optimizer (NOTE: Deprecated, use individual optimizer classes instead.).
+    # Optimizer-specific parameters.
     ###################################################################################
     # Adam.
     adam_beta1: float = 0.9
@@ -255,15 +257,14 @@ class OptimizerConfig:
     sgd_momentum: float = 0.9
     """Momentum factor for SGD optimizer."""
 
-    # Muon.
-    # TODO: move muon configs to it's own `MuonConfig`.
+    # emerging optimizers.
     muon_momentum: float = 0.95
-    """The momentum used by the internal SGD."""
+    """The momentum used by the internal SGD in Muon optimizer."""
 
     muon_split_qkv: bool = True
     """Whether to split QKV parameters for Muon optimizer."""
 
-    muon_use_nesterov: bool = False
+    muon_nesterov: bool = False
     """Whether to use Nesterov-style momentum in the internal SGD."""
 
     muon_scale_mode: str = "spectral"
@@ -272,20 +273,91 @@ class OptimizerConfig:
     muon_fp32_matmul_prec: str = "medium"
     """The precision to use for the fp32 matmul. Defaults to "medium"."""
 
+    muon_coefficient_type: str = "quintic"
+    """Newton-Schulz coefficient type for the Muon optimizer. Valid types are discovered
+    dynamically from the installed ``emerging_optimizers`` package. Defaults to "quintic"."""
+
     muon_num_ns_steps: int = 5
     """The number of iteration steps to use in the Newton-Schulz iteration."""
 
-    muon_tp_mode: str = "blockwise"
-    """How to perform NS calculation for tensor parallel weights. Defaults to "blockwise"."""
+    muon_tp_mode: str = "duplicated"
+    """How to perform NS calculation for tensor parallel weights. "blockwise" orthogonalizes
+    each shard independently, which makes the update rule depend on the parallelism config;
+    "duplicated" and "distributed" both orthogonalize the whole matrix, so results do not
+    change as TP changes. "auto" select between duplicated and distributed mode per-weight for
+    dense weights. "layer_sharded" uses LayerShardedMuon instead of TensorParallelMuon:
+    each 2D weight is assigned one NS home rank in the (GTP_remat x TP) domain — i.e. the
+    GTP domain — all_to_all stages over the gtp_remat and tp groups assemble the complete
+    (P, Q) momentum on the home, the exact same full-matrix Newton-Schulz as duplicated
+    mode runs there with zero communication and zero redundancy, and reverse all_to_all
+    stages scatter the result back to the original shards. layer_sharded requires
+    optimizer='muon', the layer-wise distributed optimizer path and muon_split_qkv=False
+    (split-QKV Newton-Schulz is not implemented on the layer-sharded path); __post_init__
+    checks all three. Defaults to "duplicated"."""
+
+    muon_use_syrk: bool = False
+    """Use the Triton SYRK kernel for the Gram matrix in Newton-Schulz iteration."""
 
     muon_extra_scale_factor: float = 1.0
     """Additional scale factor for the muon update."""
+
+    muon_ns_batch_size: int = 1
+    """Max number of same-shape matrices fused into one batched Newton-Schulz under
+    muon_tp_mode='layer_sharded', on each NS home or in a single-rank (GTP_remat x TP)
+    domain. MoE gives such a rank hundreds of identically shaped expert weights, where
+    the per-matrix loop is kernel-launch bound; batching trades transient memory for
+    fewer launches. Local NS inputs and updates are consumed one batch at a time. The
+    value is an upper bound per same-shape bucket, so a value above the matrix count
+    adds no memory. Batches of more than one use baddbmm instead of addmm and differ
+    from the per-matrix path by kernel-level rounding, so bitwise parity with duplicated
+    mode is lost; the default of 1 keeps the bit-exact path. Values > 1 require
+    emerging-optimizers >= 0.3.0."""
+
+    muon_concurrent_groups: bool = True
+    """Run each param group's layer-sharded pipeline (exchange + Newton-Schulz + update)
+    on its own CUDA stream so one group's compute fills another group's all_to_all stall.
+    Bitwise-neutral (op order within a group is unchanged), but the transient buffers of
+    all groups are live at once — disable (or lower muon_ns_batch_size) if peak memory is
+    tight. Only used when muon_tp_mode='layer_sharded'. Defaults to True."""
+
+    muon_scalar_optimizer: str = 'adam'
+    """Optimizer for nonlinear parameters (embeddings, biases, norms) when using muon.
+    One of 'adam' or 'lion'. Defaults to 'adam'."""
+
+    # Lion.
+    lion_beta1: float = 0.95
+    """First beta coefficient for Lion optimizer (used in sign update). Defaults to 0.95."""
+
+    lion_beta2: float = 0.98
+    """Second beta coefficient for Lion optimizer (used in momentum EMA update).
+    Defaults to 0.98."""
+
+    soap_shampoo_beta: float = 0.95
+    """The beta parameter for the Shampoo preconditioner."""
+
+    soap_use_kl_shampoo: bool = True
+    """Whether to use the KL-Shampoo preconditioner."""
+
+    adaptive_muon_moment2_method: str = "adamuon"
+    """The method to use for the moment2 update in Adaptive Muon optimizer."""
+
+    adaptive_muon_beta2: float = 0.95
+    """The beta2 parameter for the Adaptive Muon optimizer."""
+
+    adaptive_muon_eps: float = 1e-8
+    """The eps parameter for the Adaptive Muon optimizer."""
 
     #######################
     # Distributed optimizer
     #######################
     use_distributed_optimizer: bool = False
     """Distribute optimizer state over data-parallel replicas."""
+
+    use_layer_wise_distributed_optimizer: bool = False
+    """Use :class:`LayerWiseDistributedOptimizer` for emerging optimizers (e.g. Muon).
+    When set via ``--use-distributed-optimizer`` with an emerging optimizer, the training
+    arguments layer sets this flag and resets ``use_distributed_optimizer`` to False so
+    that the standard distributed-optimizer path is not triggered."""
 
     overlap_param_gather: bool = False
     """If true, overlap param all-gather with forward compute. 
@@ -331,6 +403,12 @@ class OptimizerConfig:
     clip_grad: float = 1.0
     """Gradient clipping based on global L2 norm."""
 
+    grad_norm_skip_threshold: float = float('inf')
+    """Skip gradient update if the gradient norm exceeds this threshold.
+
+    Disabled by default. Set a finite value to enable skip-on-large-grad behavior.
+    """
+
     log_num_zeros_in_grad: bool = False
     """If true, calculate and log the number of zeros in gradient."""
 
@@ -342,6 +420,9 @@ class OptimizerConfig:
 
     config_logger_dir: str = ""
     """When non-empty, dumps entry-point configs to config_logger_dir"""
+
+    optimizer_cuda_graph: bool = False
+    """If true, enables CUDA graph for optimizer step."""
 
     def __post_init__(self):
         """Check the validity of the config."""
@@ -372,14 +453,40 @@ class OptimizerConfig:
                     "recommended for mxfp8 training."
                 )
 
+        if self.reuse_grad_buf_for_mxfp8_param_ag and self.overlap_param_gather_with_optimizer_step:
+            raise ValueError(
+                "overlap_param_gather_with_optimizer_step is not supported with "
+                "reuse_grad_buf_for_mxfp8_param_ag."
+            )
+
+        if self.optimizer_cuda_graph:
+            assert not math.isfinite(
+                self.grad_norm_skip_threshold
+            ), 'Setting grad_norm_skip_threshold not supported with optimizer CUDA graph'
+
+        if self.muon_tp_mode == 'layer_sharded':
+            # 'dist_muon' is the deprecated alias for muon + the layer-wise path.
+            if self.optimizer not in ('muon', 'dist_muon'):
+                raise ValueError(
+                    f"muon_tp_mode='layer_sharded' requires optimizer='muon' (got "
+                    f"{self.optimizer!r}); other optimizers, including adaptive_muon, do not "
+                    "implement layer sharding."
+                )
+            if self.optimizer == 'muon' and not self.use_layer_wise_distributed_optimizer:
+                raise ValueError(
+                    "muon_tp_mode='layer_sharded' requires the layer-wise distributed "
+                    "optimizer path (use_layer_wise_distributed_optimizer=True)."
+                )
+            if self.muon_split_qkv:
+                raise ValueError(
+                    "muon_tp_mode='layer_sharded' does not implement split-QKV Newton-Schulz; "
+                    "set muon_split_qkv=False."
+                )
+
         if self.use_precision_aware_optimizer:
             assert (
                 self.optimizer == 'adam'
             ), '--use-precision-aware-optimizer only supported with adam'
-            assert (
-                self.use_distributed_optimizer
-            ), '--use-precision-aware-optimizer only supported with distributed optimizer'
-
             if not is_te_min_version("2.1.0"):
                 self.store_param_remainders = False
 
@@ -426,33 +533,6 @@ class OptimizerConfig:
             ), "exp_avg_sq_dtype can only be fp32 when not using precision-aware optimizer"
 
 
-@dataclass
-class AdamOptimizerConfig(OptimizerConfig):
-    """Adam optimizer configuration object."""
-
-    optimizer: str = 'adam'
-    """Optimizer name."""
-
-    adam_beta1: float = 0.9
-    """First coefficient for computing running averages of gradient and its square in Adam
-    optimizer.
-    """
-
-    adam_beta2: float = 0.999
-    """Second coefficient for computing running averages of gradient and its square in Adam
-    optimizer.
-    """
-
-    adam_eps: float = 1e-08
-    """Term added to the denominator to improve numerical stability in Adam optimizer."""
-
-
-@dataclass
-class SGDOptimizerConfig(OptimizerConfig):
-    """SGD optimizer configuration object."""
-
-    optimizer: str = 'sgd'
-    """Optimizer name."""
-
-    sgd_momentum: float = 0.9
-    """Momentum factor for SGD optimizer."""
+# Backward-compatible aliases (deprecated; use OptimizerConfig directly).
+AdamOptimizerConfig = OptimizerConfig
+SGDOptimizerConfig = OptimizerConfig

@@ -1,5 +1,41 @@
 # Data Pipeline
 
+Packed training and evaluation support `--pad-packed-seq-alignment N` (a CP-local
+token multiple before SP) or `max` (pad to `--max-seqlen-per-dp-cp-rank`). MXFP8
+automatically requires a multiple of 32 tokens after SP; the effective alignment
+combines that requirement with the requested multiple. Padding is added before
+CP layout construction, with masked dummy sequences and consistent THD metadata.
+The scheduler reserves an aligned capacity; padding never truncates valid tokens.
+This eager path does not require CUDA graphs.
+
+When unpacking SFT data, prompt-only sub-sequences are retained so packing can
+still fill all DP ranks; their zero loss masks exclude them from the loss. A DP
+rank can contribute no samples and still receive scheduled work. A global batch
+with no sequences is rejected on all ranks.
+
+Dynamic CP does not currently support `--deterministic-mode`, CUDA graphs, or
+router z-loss. Configuration validation rejects these combinations before training.
+Static sequence packing without dynamic CP retains its existing deterministic-mode
+support. Dynamic CP for Hybrid models follows in PR #7048.
+
+Batch helpers use `dynamic_cp` and `dynamic_cp_group_func`. The old `is_hybrid_cp`
+and `hybrid_cp_group_func` keyword arguments remain accepted with a deprecation
+warning for downstream callers. Positional arguments and the legacy
+`hybrid_cp_group` batch metadata are unchanged during this compatibility window.
+The deprecated keywords also remain visible to signature-based feature detection
+used by downstream consumers such as MBridge.
+
+The `gpt_packed_train_eval` functional test runs the real GPT entrypoint on eight
+GPUs with TP2/PP2, synthetic variable-length data, and static or dynamic packing.
+It checks finite training/evaluation losses and gradient norms, a completed
+checkpoint, and CP1/CP2 coverage in both training and evaluation. It does not
+claim deterministic or golden-loss equivalence. Run it from the repository root:
+
+```bash
+python tests/functional_tests/test_cases/gpt/gpt_packed_train_eval/run_test.py \
+  --packing-mode dynamic --output-path /path/to/a/new/output-directory
+```
+
 ## Data pre-processing
 
 Data preprocessing is built around the following classes:
@@ -192,9 +228,53 @@ To query the `BlendedDataset` for the _k_-th sample we do the following
 
 To save time during initialization, each index is built/cached sequentially on one process rank and subsequently loaded in parallel on other process ranks. The cached indices are unique to a hash generated in the `BlendedDataset.__init__` function.
 
+## Offline cache preparation
+
+For GPT-style training, the dataset caches described above can be prepared ahead of time with `tools/prepare_cache.py` instead of waiting for rank 0 to build them during training startup.
+
+The script reuses the normal dataset construction path used by `pretrain_gpt.py` and `pretrain_mamba.py`, including `GPTDataset`, `BlendedDataset`, and `BlendedMegatronDatasetBuilder`. It accepts the usual dataset arguments, supports blends and per-split dataset definitions, and requires `--data-cache-path` so the generated cache can later be reused by training.
+
+This is especially useful for large blends or many file prefixes, where building the document, sample, and shuffle indices can take several minutes and leave all GPUs idle while rank 0 performs CPU-only work.
+
+If the later training job does not specify `--global-batch-size` (which is needed to determine the dataset size and splits), you should specify `--prepare-cache-world-size` to explicitly set the world size used during cache preparation.
+
+`tools/prepare_cache.py` does not support `--mock-data`, `--sft`, `--fim-data`, or `--step-batch-size-schedule`.
+
+## Packing Scheduler
+
+The packing scheduler re-schedules variable-length sequences across DP×CP ranks to improve GPU utilization. It is built around the following modules:
+
+### `data_schedule`
+
+This module contains the high-level scheduling logic and entry points:
+
+- **`BasePackingScheduler`**: Abstract base class for packing schedulers. Defines the interface for `get_groups_and_subsamples()` (scheduling algorithm) and `run()` (full scheduling pipeline including fetch, schedule, reroute, pack, broadcast, and VPP handling).
+
+- **`DpBalancedScheduler`**: A concrete scheduler that packs sequences in their original order until reaching the max sequence length limit per DPxCP rank. Supports aligning the number of microbatches to DP size and VPP stage multiples.
+
+- **`DefaultDynamicCPScheduler`**: Selects a valid runtime CP group for each packed microbatch while balancing sequences across the DP×CP domain.
+
+- **`wrap_data_iterator()`**: Top-level entry point that wraps an existing `data_iterator`. It creates the appropriate scheduler, runs the scheduling pipeline, broadcast metadata and new num_microbatches, returns a new data iterator along with the updated number of microbatches and FLOPs statistics.
+
+- **`get_batch_on_this_rank_for_sequence_packing()`**: Fetches and broadcasts a single packed microbatch for the current rank. Handles TP/PP broadcasting, constructs `PackedSeqParams` (with `cu_seqlens`, `max_seqlen`, `qkv_format=thd`), and optionally partitions sequences across CP ranks using Transformer Engine's `thd_get_partitioned_indices`.
+
+Both entry points require a caller-owned `ProcessGroupCollection`. Scheduling uses its
+`tp`, `pp`, `dp`, and `dp_cp` groups; batch preparation uses `tp`, `pp`, and `cp`, plus
+`tp_cp` for static CP layout conversion with sequence parallelism. Dynamic CP selects
+pre-created groups from `dynamic_cp` and `dynamic_tp_cp`, whose keys are runtime CP sizes
+(the groups in `dynamic_tp_cp` have `TP size * CP size` ranks). The scheduler only selects
+sizes present in `dynamic_cp`; the static `cp` group remains unchanged. The standard GPT
+and Hybrid forward steps pass their model's collection. Legacy training entrypoints may
+bootstrap a collection with `ProcessGroupCollection.use_mpu_process_groups()` before
+calling Core, while independent parallel grids supply their own groups directly.
+
+### `data_schedule_utils.py`
+
+This module contains the utility functions used by the schedulers.
+
 ## Fast DataLoader initialization
 
-Especially for large-scale runs, DataLoader initialization can take several minutes, since it involves opening and memory-mapping multiple files and can significantly stress the filesystem. To speed up this process, we have developed the following three optimizations, controlled by configuration flags":
+Especially for large-scale runs, DataLoader initialization can take several minutes, since it involves opening and memory-mapping multiple files and can significantly stress the filesystem. To speed up this process, we have developed the following three optimizations, controlled by configuration flags:
 
   - `--dataloader-fast-cache-load`: This option assumes that the dataset cache already exists in the specified `--data-cache-path`. When enabled, it speeds up the creation process by removing synchronization points and file check assertions.
 

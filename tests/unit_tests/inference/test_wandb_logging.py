@@ -7,6 +7,8 @@ from unittest.mock import MagicMock, Mock, create_autospec, patch
 import pytest
 import torch
 
+from megatron.core.inference.batch_dimensions_utils import TOKEN_ROUNDER
+from megatron.core.inference.config import InferenceConfig
 from megatron.core.inference.contexts.dynamic_context import DynamicInferenceContext
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.inference_request import DynamicInferenceRequest
@@ -15,30 +17,36 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
+from megatron.core.transformer.transformer_config import TransformerConfig
 from tests.unit_tests.test_utilities import Utils
 
 
 def set_rounder(value):
-    """Utility function to set the DynamicInferenceContext rounder."""
     DynamicInferenceContext.ROUNDER = value  # For backwards compatibility
     DynamicInferenceContext.TOKEN_ROUNDER = value
     DynamicInferenceContext.REQUEST_ROUNDER = value
 
 
+def reset_rounder():
+    DynamicInferenceContext.ROUNDER = TOKEN_ROUNDER
+    DynamicInferenceContext.TOKEN_ROUNDER = TOKEN_ROUNDER
+    DynamicInferenceContext.REQUEST_ROUNDER = 4  # the default in dynamic_context.py
+
+
 class TestInferenceWandbLogging:
     """Test suite for wandb logging in inference."""
 
-    def setup_method(self):
-        """Set up test fixtures."""
+    @classmethod
+    def setup_class(cls):
         Utils.initialize_model_parallel(
             tensor_model_parallel_size=1, pipeline_model_parallel_size=1
         )
         model_parallel_cuda_manual_seed(123)
         set_rounder(64)
 
-    def teardown_method(self):
-        """Clean up test fixtures."""
-        set_rounder(64)
+    @classmethod
+    def teardown_class(cls):
+        reset_rounder()
         Utils.destroy_model_parallel()
 
     def _get_dynamic_context(
@@ -50,20 +58,26 @@ class TestInferenceWandbLogging:
         max_sequence_length=512,
         buffer_size_gb=0.03,
         block_size_tokens=128,
+        logging_step_interval=0,
         metrics_writer=None,
     ):
         """Helper to create a DynamicInferenceContext."""
         return DynamicInferenceContext(
-            params_dtype=params_dtype,
-            num_layers=num_layers,
-            kv_channels=kv_channels,
-            num_attention_heads=num_attention_heads,
-            max_sequence_length=max_sequence_length,
-            num_cuda_graphs=None,
-            buffer_size_gb=buffer_size_gb,
-            block_size_tokens=block_size_tokens,
-            metrics_writer=metrics_writer,
-            unified_memory_level=0,  # unit tests currently broken with UVM
+            model_config=TransformerConfig(
+                params_dtype=params_dtype,
+                num_layers=num_layers,
+                kv_channels=kv_channels,
+                num_attention_heads=num_attention_heads,
+            ),
+            inference_config=InferenceConfig(
+                max_sequence_length=max_sequence_length,
+                num_cuda_graphs=None,
+                buffer_size_gb=buffer_size_gb,
+                block_size_tokens=block_size_tokens,
+                unified_memory_level=0,  # unit tests currently broken with UVM
+                logging_step_interval=logging_step_interval,
+                metrics_writer=metrics_writer,
+            ),
         )
 
     @pytest.mark.internal
@@ -96,6 +110,7 @@ class TestInferenceWandbLogging:
         assert stats['paused_request_count'] == 0
         assert stats['active_token_count'] == 0
         assert stats['total_request_count'] == 0
+        assert stats['block_count_avail'] == dynamic_context.kv_block_allocator.pool_avail
 
         # Now add a request and verify stats update correctly
         context_length = 144
@@ -137,11 +152,12 @@ class TestInferenceWandbLogging:
 
         # Verify block availability decreased after allocation
         assert stats_after['block_count_avail'] < stats['block_count_avail']
+        assert stats_after['block_count_avail'] == dynamic_context.kv_block_allocator.pool_avail
 
-        # Verify relationship: allocated_blocks + block_count_avail + 1 (dummy) = total
+        # Physical occupancy plus raw free blocks and the dummy block equals total.
         assert (
             stats_after['allocated_blocks'] + stats_after['block_count_avail'] + 1
-            == dynamic_context.block_allocator.total_count
+            == dynamic_context.kv_block_allocator.pool_size
         )
 
         # Verify utilization bounds [0, 1]
@@ -195,27 +211,27 @@ class TestInferenceWandbLogging:
     @pytest.mark.internal
     @patch('megatron.core.inference.engines.dynamic_engine.HAVE_WANDB', True)
     def test_engine_logging_step_interval_zero(self):
-        """Test that no logging occurs when inference_logging_step_interval is 0."""
+        """Test that no logging occurs when logging_step_interval is 0."""
         mock_wandb = Mock()
         mock_wandb.__name__ = "wandb"
         mock_wandb.log = Mock()
 
-        dynamic_context = self._get_dynamic_context(metrics_writer=mock_wandb)
+        dynamic_context = self._get_dynamic_context(
+            logging_step_interval=0, metrics_writer=mock_wandb
+        )
 
         # Create mock controller with proper spec to pass isinstance checks
         mock_controller = create_autospec(TextGenerationController, instance=True)
+        mock_controller._async_sched_forward = Mock()
         # Set up nested mock structure
         mock_controller.inference_wrapped_model = Mock()
         mock_controller.inference_wrapped_model.model = Mock()
         mock_controller.inference_wrapped_model.model.config = Mock()
         mock_controller.inference_wrapped_model.model.config.cuda_graph_impl = "none"
+        mock_controller.inference_wrapped_model.model.config.moe_enable_routing_replay = False
+        mock_controller.num_mtp_depths = 0
 
-        engine = DynamicInferenceEngine(
-            controller=mock_controller,
-            context=dynamic_context,
-            random_seed=123,
-            inference_logging_step_interval=0,  # Disabled
-        )
+        engine = DynamicInferenceEngine(controller=mock_controller, context=dynamic_context)
 
         # Verify log was never called
         mock_wandb.log.assert_not_called()
@@ -225,15 +241,16 @@ class TestInferenceWandbLogging:
         """Test that paused requests are correctly reflected in stats."""
         set_rounder(1)
         dynamic_context = DynamicInferenceContext(
-            params_dtype=torch.float32,
-            num_layers=2,
-            kv_channels=64,
-            num_attention_heads=8,
-            max_sequence_length=128,
-            num_cuda_graphs=None,
-            buffer_size_gb=0.01,  # Small buffer to force pausing
-            block_size_tokens=32,
-            unified_memory_level=0,  # unit tests currently broken with UVM
+            model_config=TransformerConfig(
+                params_dtype=torch.float32, num_layers=2, kv_channels=64, num_attention_heads=8
+            ),
+            inference_config=InferenceConfig(
+                max_sequence_length=128,
+                num_cuda_graphs=None,
+                buffer_size_gb=0.01,  # Small buffer to force pausing
+                block_size_tokens=32,
+                unified_memory_level=0,  # unit tests currently broken with UVM
+            ),
         )
 
         # Add multiple requests to potentially trigger pausing
@@ -253,28 +270,27 @@ class TestInferenceWandbLogging:
             # Verify paused request count is included
             assert 'paused_request_count' in stats
             assert stats['paused_request_count'] >= 0
+        set_rounder(64)  # back to the class's pin
 
     @pytest.mark.internal
     def test_metrics_writer_none_handling(self):
         """Test that engine handles None metrics_writer gracefully."""
-        dynamic_context = self._get_dynamic_context(metrics_writer=None)
+        dynamic_context = self._get_dynamic_context(logging_step_interval=10, metrics_writer=None)
 
         # Create mock controller with proper spec to pass isinstance checks
         mock_controller = create_autospec(TextGenerationController, instance=True)
+        mock_controller._async_sched_forward = Mock()
         # Set up nested mock structure
         mock_controller.inference_wrapped_model = Mock()
         mock_controller.inference_wrapped_model.model = Mock()
         mock_controller.inference_wrapped_model.model.config = Mock()
         mock_controller.inference_wrapped_model.model.config.cuda_graph_impl = "none"
+        mock_controller.inference_wrapped_model.model.config.moe_enable_routing_replay = False
+        mock_controller.num_mtp_depths = 0
 
         # Should not raise error even with logging interval set
-        engine = DynamicInferenceEngine(
-            controller=mock_controller,
-            context=dynamic_context,
-            random_seed=123,
-            inference_logging_step_interval=10,
-        )
+        engine = DynamicInferenceEngine(controller=mock_controller, context=dynamic_context)
 
         # Verify engine was created successfully
-        assert engine.inference_logging_step_interval == 10
-        assert engine.context.metrics_writer is None
+        assert engine.logging_step_interval == 10
+        assert engine.metrics_writer is None

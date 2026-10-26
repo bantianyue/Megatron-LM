@@ -1,15 +1,16 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
+import fnmatch
 import functools
 import logging
 import math
-import warnings
 from contextlib import nullcontext
 from enum import Enum
 from functools import partial
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
+from torch._utils import _flatten_dense_tensors, _unflatten_dense_tensors
 from torch.distributed import _coalescing_manager
 
 import megatron.core.nccl_allocator as nccl_allocator
@@ -18,13 +19,27 @@ from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.utils import log_single_rank
 
+from .._rank_utils import warn_single_rank
+from ..fp4_utils import (
+    get_nvfp4_rowwise_packed_shape,
+    is_grouped_nvfp4tensor,
+    is_nvfp4tensor,
+    modify_grouped_nvfp4_rowwise_storage,
+    modify_nvfp4_rowwise_storage,
+)
 from ..fp8_utils import (
+    copy_tensors_to_quantized_params,
     is_float8tensor,
+    is_grouped_mxfp8tensor,
+    is_grouped_tensor,
+    is_grouped_tensor_with_quantized_storage,
     is_mxfp8tensor,
+    modify_grouped_tensor_rowwise_storage,
     modify_underlying_storage,
     post_all_gather_processing,
 )
-from ..utils import is_torch_min_version, log_on_each_pipeline_stage
+from ..optimizer.param_layout import pad_bucket_end, pad_param_start
+from ..utils import is_torch_min_version
 from .distributed_data_parallel_config import DistributedDataParallelConfig
 from .reduce_scatter_with_fp32_accumulation import reduce_scatter_with_fp32_accumulation
 
@@ -40,8 +55,6 @@ try:
 except:
     dist_all_gather_func = torch.distributed._all_gather_base
     dist_reduce_scatter_func = torch.distributed._reduce_scatter_base
-
-import megatron.core.nccl_allocator as nccl_allocator
 
 
 class BufferType(Enum):
@@ -65,6 +78,17 @@ def shard_buffer(buffer: torch.Tensor, data_parallel_world_size: int):
     return sharded_buffer
 
 
+def _param_uses_quantized_storage(param: torch.nn.Parameter) -> bool:
+    """Return whether the parameter owns TE quantized storage instead of plain tensor storage."""
+    # In TE2, is_float8tensor() checks QuantizedTensor, so it includes plain MXFP8Tensor.
+    # Grouped quantized params are GroupedTensor wrappers, so check their backing storage.
+    return (
+        is_float8tensor(param)
+        or is_nvfp4tensor(param)
+        or is_grouped_tensor_with_quantized_storage(param)
+    )
+
+
 class _ParamAndGradBucket:
     """
     Bucket to keep track of a subset of the model's parameters and gradients.
@@ -79,6 +103,10 @@ class _ParamAndGradBucket:
             communication. Its application is twofold: it facilitates the averaging of gradients
             and the scaling of gradients in the context of the Mixture of Experts (MoE) model.
         bucket_id: Index of bucket in buffer.
+        param_index_map: Mapping from param to (start, end, bucket_id) in the global buffer.
+            Used to derive bucket-local offsets for param_to_index.
+        params_with_extra_main_grads: List of parameters in this bucket that require a
+            separate higher-precision main_grad tensor for local gradient accumulation.
     """
 
     def __init__(
@@ -90,6 +118,8 @@ class _ParamAndGradBucket:
         numel_unpadded: int,
         gradient_scaling_factor: float,
         bucket_id: int,
+        param_index_map: Dict[torch.nn.Parameter, tuple],
+        params_with_extra_main_grads: List[torch.nn.Parameter],
     ):
         self.params_list = params
         self.params = set(params)
@@ -103,11 +133,90 @@ class _ParamAndGradBucket:
         self.numel_unpadded = numel_unpadded
         self.gradient_scaling_factor = gradient_scaling_factor
         self.bucket_id = bucket_id
+        # Derive bucket-local param offsets from the global param_index_map.
         self.param_to_index = {}
-        offset = 0
         for param in params:
-            self.param_to_index[param] = (offset, offset + param.numel())
-            offset += param.numel()
+            global_start, global_end, _ = param_index_map[param]
+            self.param_to_index[param] = (global_start - offset, global_end - offset)
+        self.params_with_extra_main_grads = params_with_extra_main_grads
+
+        # Layer-wise optimizer attributes for async param gather.
+        self.layerwise_params_list = None
+        self.layerwise_param_flat_sizes = None
+        self.layerwise_gather_list = None
+
+    @torch.no_grad()
+    def _stage_layerwise_mxfp8_params(self, local_data_view: torch.Tensor, local_rank: int) -> None:
+        """Stage owner-rank LayerWise MXFP8 masters into the BF16 all-gather input.
+
+        LayerWise layouts keep each parameter wholly inside one data-parallel shard.
+        Unlike regular BF16 parameters, MXFP8 parameters retain TE-owned storage, so
+        updating ``param.data`` does not update this bucket's parameter buffer.
+        """
+        if not self.params_list or not getattr(
+            self.params_list[0], 'is_managed_by_layer_wise_optimizer', False
+        ):
+            return
+
+        local_shard_start = local_rank * local_data_view.numel()
+        local_shard_end = local_shard_start + local_data_view.numel()
+        for param in self.params_list:
+            if not (is_mxfp8tensor(param) or is_grouped_mxfp8tensor(param)):
+                continue
+
+            param_start, param_end = self.param_to_index[param]
+            if param_end <= local_shard_start or local_shard_end <= param_start:
+                continue
+            if not (local_shard_start <= param_start and param_end <= local_shard_end):
+                raise RuntimeError(
+                    "LayerWise MXFP8 parameter must be entirely inside its owner's DDP shard."
+                )
+
+            main_param = getattr(param, 'main_param', None)
+            if main_param is None:
+                raise RuntimeError(
+                    "The owner of a LayerWise MXFP8 parameter must have its FP32 main parameter."
+                )
+
+            param_slot = local_data_view[
+                param_start - local_shard_start : param_end - local_shard_start
+            ]
+            if param_slot.numel() != main_param.numel():
+                raise RuntimeError(
+                    "LayerWise MXFP8 master and DDP parameter slot must have equal size: "
+                    f"master={main_param.numel()}, slot={param_slot.numel()}."
+                )
+            param_slot.copy_(main_param.detach().reshape(-1))
+
+    def set_layerwise_params_list(self, layerwise_params_list: List[List[torch.nn.Parameter]]):
+        """Set per-rank parameter lists for layer-wise async all-gather.
+
+        Args:
+            layerwise_params_list: List of param lists, one per rank in the DP group.
+                Each inner list contains the parameters owned by that rank's
+                layer-wise optimizer that also belong to this bucket.
+        """
+        self.layerwise_params_list = layerwise_params_list
+        self.layerwise_param_flat_sizes = [
+            sum([p.numel() for p in param_list]) for param_list in layerwise_params_list
+        ]
+
+
+class _LayerwiseAllGatherHandle:
+    """Handle wrapping multiple async all-gather work objects.
+
+    NCCL guarantees in-order completion on the same communicator, so waiting
+    on only the last handle is sufficient.
+    """
+
+    def __init__(self, handles):
+        self.handles = handles
+
+    def wait(self):
+        """Wait on the last handle and clear all handles."""
+        if self.handles:
+            self.handles[-1].wait()
+        self.handles = None
 
 
 class _ParamAndGradBucketGroup:
@@ -135,11 +244,14 @@ class _ParamAndGradBucketGroup:
         self.buckets = buckets
         self.ddp_config = ddp_config
 
-        if self.ddp_config.use_distributed_optimizer:
+        # LayerWise parameter sync can use this collective group without the distributed
+        # optimizer: asynchronously when overlap is enabled, or synchronously when MXFP8 reuses
+        # grad_data as its BF16 all-gather transport.
+        if self.ddp_config.param_sync_via_bucket_group:
             self.intra_distributed_optimizer_instance_group = collective_group
             self.intra_distributed_optimizer_instance_size = collective_group_size
             self.intra_distributed_optimizer_instance_rank = collective_group.rank()
-        else:
+        if not self.ddp_config.use_distributed_optimizer:
             self.data_parallel_group = collective_group
 
         # State for bookkeeping: params is the set of parameters this bucket group is
@@ -152,6 +264,12 @@ class _ParamAndGradBucketGroup:
                 self.params.add(param)
 
         self.next_param_gather_bucket_group = None
+        # Set in DistributedDataParallel.__init__ when reduce_scatter_with_fp32_accumulation is on:
+        # points to the bucket group whose grad-reduce was dispatched immediately before mine in
+        # the backward pass. start_grad_sync drains this predecessor before dispatching its own
+        # collective, so the predecessor's intermediate all-to-all buffer is freed before the new
+        # one is allocated.
+        self.previous_grad_reduce_bucket_group = None
 
         if self.ddp_config.num_distributed_optimizer_instances > 1:
             self.inter_distributed_optimizer_instance_group = None
@@ -159,6 +277,16 @@ class _ParamAndGradBucketGroup:
             assert (
                 not self.ddp_config.reduce_scatter_with_fp32_accumulation
             ), "RS w/ FP32 accumulation not supported with num_distributed_optimizer_instances > 1"
+
+        reduction_collective = (
+            "reduce-scatter" if self.ddp_config.use_distributed_optimizer else "all-reduce"
+        )
+        log_single_rank(
+            logger,
+            logging.INFO,
+            f"Using {reduction_collective} for gradient reductions because "
+            f"{self.ddp_config.use_distributed_optimizer=}",
+        )
 
         global dist_reduce_scatter_func
         if self.ddp_config.reduce_scatter_with_fp32_accumulation:
@@ -188,6 +316,10 @@ class _ParamAndGradBucketGroup:
         self.param_gather_handle = None
         self.param_gather_dispatched = False
         self.grad_reduce_handle = None
+        # Per-iteration flag: True once finish_grad_sync has run this step. Lets a successor
+        # bucket group early-drain its predecessor without the end-of-step finalize loop
+        # double-waiting. Reset by `reset()`.
+        self.grad_reduce_finished = False
 
         # Each time a local shard is created from bucket.param_data or bucket.grad_data, it
         # introduces some CPU overheads. We use these two lists to cache the created local
@@ -208,6 +340,64 @@ class _ParamAndGradBucketGroup:
             self.is_first_batch = False
         self.per_param_grad_ready_counts = {}
         self.is_last_microbatch = True
+        self.grad_reduce_finished = False
+
+    def _post_param_sync(self):
+        """Run post-processing after param all-gather completes."""
+        # Inference packing may redirect plain parameters into serving buffers.
+        # Copy only after all-gather: each optimizer rank updates just a shard.
+        for bucket in self.buckets:
+            if bucket.param_data is None:
+                continue
+            for param in bucket.params:
+                if _param_uses_quantized_storage(param) or is_grouped_tensor(param):
+                    continue
+                start, end = bucket.param_to_index[param]
+                gathered_param = bucket.param_data[start:end].view_as(param)
+                if param.data_ptr() != gathered_param.data_ptr():
+                    param.data.copy_(gathered_param)
+
+        if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+            for bucket in self.buckets:
+                if bucket.param_data is None:
+                    # LayerWise variable-size gather path: params are already updated via
+                    # unflatten + copy_ in finish_param_sync, and there is no param_data
+                    # buffer to copy back from.
+                    continue
+                has_non_quantized_weight = False
+                quantized_params = []
+                param_slices = []
+                flat_param_data = bucket.param_data.view(-1)
+                for param in bucket.params:
+                    # Non-quantized weights are already mapped to param.data. Skip
+                    # mixed buckets because zeroing bucket.param_data would also
+                    # clear those model weights.
+                    if not _param_uses_quantized_storage(param):
+                        has_non_quantized_weight = True
+                        break
+                    param_start, param_end = bucket.param_to_index[param]
+                    quantized_params.append(param)
+                    param_slices.append(flat_param_data[param_start:param_end])
+                # Cast the bucket in one call: these casts are small, so the per-param cost of
+                # issuing them is worth avoiding.
+                copy_tensors_to_quantized_params(quantized_params, param_slices)
+                if has_non_quantized_weight:
+                    continue
+                # All-gathered params are not needed after being copied to param.data.
+                # Zero out the param buffer (shared with grad buffer) for gradient accumulation.
+                # We cannot zero out the entire grad buffer because one grad buffer may
+                # correspond to multiple param buffers. If we zero out the entire grad buffer,
+                # it would clear the data of those param buffers that have not yet completed AG.
+                bucket.param_data.zero_()
+            return
+
+        quantized_params = []
+        for bucket in self.buckets:
+            for param in bucket.params:
+                if _param_uses_quantized_storage(param):
+                    quantized_params.append(param)
+        if len(quantized_params) > 0:
+            post_all_gather_processing(quantized_params)
 
     def check_grads(self, check_for_nan_or_inf, check_for_large):
         """
@@ -259,44 +449,149 @@ class _ParamAndGradBucketGroup:
             force_sync (bool, optional): force synchronous collective regardless of
                 other settings if true.
         """
-        assert self.ddp_config.use_distributed_optimizer
+        assert self.ddp_config.param_sync_via_bucket_group
 
         if force_sync:
             if self.param_gather_handle is not None:
                 self.param_gather_handle.wait()
                 self.param_gather_handle = None
+                self._post_param_sync()
                 return
         else:
             assert self.param_gather_handle is None
 
         async_op = self.ddp_config.overlap_param_gather and not force_sync
-        # Coalesce communication kernels across buckets in the bucket group.
-        with _coalescing_manager(
-            self.intra_distributed_optimizer_instance_group, async_ops=async_op
-        ) as cm:
-            for idx, bucket in enumerate(self.buckets):
-                if self.cached_param_buffer_shard_list[idx] is None:
-                    self.cached_param_buffer_shard_list[idx] = shard_buffer(
-                        bucket.param_data, self.intra_distributed_optimizer_instance_size
-                    )
-                local_data_view = self.cached_param_buffer_shard_list[idx][
-                    self.intra_distributed_optimizer_instance_rank
-                ]
-                dist_all_gather_func(
-                    bucket.param_data,
-                    local_data_view,
-                    group=self.intra_distributed_optimizer_instance_group,
-                    async_op=async_op,
+
+        if not self.ddp_config.use_distributed_optimizer:
+            # Legacy layer-wise optimizer path: use all_gather for variable-size
+            # param gather.  Once all layerwise call sites set
+            # ddp_config.use_distributed_optimizer=True, this branch can be removed.
+            #
+            # Each rank may own a different number of params per bucket, so
+            # layerwise_param_flat_sizes can vary across ranks.  PyTorch's NCCL
+            # backend handles uneven tensor sizes in torch.distributed.all_gather
+            # (falling back to grouped send/recv internally when sizes differ),
+            # so no manual padding is needed.
+            dp_size = self.intra_distributed_optimizer_instance_size
+            if dp_size == 1:
+                # Single-rank group (e.g., expt_dp_size == 1): no all-gather needed.
+                if force_sync and self.ddp_config.overlap_param_gather:
+                    self._post_param_sync()
+                self.param_gather_dispatched = True
+                return
+            local_rank = self.intra_distributed_optimizer_instance_rank
+            group = self.intra_distributed_optimizer_instance_group
+            layerwise_work_handles = []
+            for bucket in self.buckets:
+                # Use param dtype (e.g., bf16), NOT grad dtype (which may be
+                # fp32 when grad_reduce_in_fp32 is enabled).
+                param_dtype = bucket.params_list[0].dtype
+
+                if max(bucket.layerwise_param_flat_sizes) == 0:
+                    bucket.layerwise_gather_list = None
+                    continue
+
+                local_size = bucket.layerwise_param_flat_sizes[local_rank]
+                total_gather_size = sum(bucket.layerwise_param_flat_sizes)
+
+                # Reuse grad_data as the all_gather receive buffer; it is idle
+                # during forward and grad_dtype.element_size >= param_dtype.
+                reuse_buf = bucket.grad_data.view(param_dtype)
+                assert reuse_buf.numel() >= total_gather_size
+
+                # Partition reuse_buf into contiguous per-rank receive slices.
+                gather_list = []
+                offset = 0
+                for i in range(dp_size):
+                    size = bucket.layerwise_param_flat_sizes[i]
+                    gather_list.append(reuse_buf[offset : offset + size])
+                    offset += size
+                local_slot_view = gather_list[local_rank]
+
+                # Flatten local params and copy into the local rank's slot.
+                # Detach from autograd since start_param_sync may be called
+                # during the forward pass where autograd is active.
+                if local_size > 0:
+                    # MXFP8 params can't be flattened (view(-1) unsupported); gather the
+                    # fp32 master (param.main_param -> bf16), which the receive-side copy_
+                    # re-quantizes. Non-mxfp8 params flatten as-is.
+                    src_params = []
+                    for p in bucket.layerwise_params_list[local_rank]:
+                        if is_mxfp8tensor(p):
+                            main_param = getattr(p, "main_param", None)
+                            assert main_param is not None, (
+                                "LayerWise mxfp8 param sync needs param.main_param (fp32 "
+                                "master) to stage the all-gather source; got None."
+                            )
+                            src_params.append(main_param.to(param_dtype))
+                        else:
+                            src_params.append(p)
+                    flat_local_params = _flatten_dense_tensors(src_params).detach()
+                    local_slot_view.copy_(flat_local_params)
+                bucket.layerwise_gather_list = gather_list
+
+                work = torch.distributed.all_gather(
+                    gather_list, local_slot_view, group=group, async_op=async_op
                 )
-        if async_op:
-            self.param_gather_handle = cm
+                if async_op and work is not None:
+                    layerwise_work_handles.append(work)
+
+            if async_op:
+                self.param_gather_handle = _LayerwiseAllGatherHandle(layerwise_work_handles)
+            else:
+                # Synchronous: unflatten and copy gathered params immediately.
+                for bucket in self.buckets:
+                    if bucket.layerwise_gather_list is None:
+                        continue
+                    for idx, params in enumerate(bucket.layerwise_params_list):
+                        if len(params) == 0 or idx == local_rank:
+                            continue
+                        updated_params = _unflatten_dense_tensors(
+                            bucket.layerwise_gather_list[idx], params
+                        )
+                        for updated_p, model_p in zip(updated_params, params):
+                            model_p.data.copy_(updated_p)
+                    bucket.layerwise_gather_list = None
+                    # Zero out grad_data since it was reused as the all-gather
+                    # receive buffer. Without this, accumulation into main_grad
+                    # (a view into grad_data) would start from the result of the
+                    # latest parameter all-gather instead of zero.
+                    bucket.grad_data.zero_()
+                self.param_gather_handle = None
         else:
-            # When using `_coalescing_manager`, even if a synchronous op (async_op=False) is used,
-            # `cm` is not None, which is different from when `_coalescing_manager` is not used in
-            # which case the torch.distributed._all_gather_base() will return None. In order to
-            # maintain consistency with prior code, we need to manually set communication handle to
-            # None.
-            self.param_gather_handle = None
+            # Standard distributed optimizer path: use _coalescing_manager.
+            # all_gather_into_tensor writes directly into a contiguous output buffer and
+            # does not need a copy-back step, so coalescing works correctly.
+            with _coalescing_manager(
+                self.intra_distributed_optimizer_instance_group, async_ops=async_op
+            ) as cm:
+                for idx, bucket in enumerate(self.buckets):
+                    if self.cached_param_buffer_shard_list[idx] is None:
+                        self.cached_param_buffer_shard_list[idx] = shard_buffer(
+                            bucket.param_data, self.intra_distributed_optimizer_instance_size
+                        )
+                    local_data_view = self.cached_param_buffer_shard_list[idx][
+                        self.intra_distributed_optimizer_instance_rank
+                    ]
+                    if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+                        bucket._stage_layerwise_mxfp8_params(
+                            local_data_view, self.intra_distributed_optimizer_instance_rank
+                        )
+                    dist_all_gather_func(
+                        bucket.param_data,
+                        local_data_view,
+                        group=self.intra_distributed_optimizer_instance_group,
+                        async_op=async_op,
+                    )
+            if async_op:
+                self.param_gather_handle = cm
+            else:
+                # When using `_coalescing_manager`, even if a synchronous op
+                # (async_op=False) is used, `cm` is not None. Manually set to None for
+                # consistency with prior code.
+                self.param_gather_handle = None
+        if force_sync and self.ddp_config.overlap_param_gather:
+            self._post_param_sync()
         self.param_gather_dispatched = True
 
     def finish_param_sync(self, skip_next_bucket_dispatch: bool = False):
@@ -314,7 +609,6 @@ class _ParamAndGradBucketGroup:
             skip_next_bucket_dispatch (bool, optional): if true, dispatch next
                 bucket's communication if available.
         """
-        assert self.ddp_config.use_distributed_optimizer
         assert self.ddp_config.overlap_param_gather
 
         # If current bucket's param AG has not been dispatched, dispatch it now (e.g., first
@@ -328,7 +622,9 @@ class _ParamAndGradBucketGroup:
             # Dispatch next bucket's asynchronous param AG only if it has not been dispatched yet.
             if self.next_param_gather_bucket_group is not None and not skip_next_bucket_dispatch:
                 if self.next_param_gather_bucket_group.param_gather_dispatched:
-                    warnings.warn(
+                    # Registration order versus forward order is a property of the model,
+                    # so every rank hits this together and one report is enough.
+                    warn_single_rank(
                         "The next bucket's parameter all-gather operation has already been "
                         "dispatched. This may be caused by a mismatch between the order of "
                         "parameter registration and forward pass execution, which will "
@@ -337,29 +633,30 @@ class _ParamAndGradBucketGroup:
                 else:
                     self.next_param_gather_bucket_group.start_param_sync()
 
-            # For the mxfp8_param with "reuse_grad_buf_for_mxfp8_param_ag=True",
-            # we need to copy the param_data from the shared_param/grad_buffer to param.data
-            # after the param all-gather.
-            if self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
+            if not self.ddp_config.use_distributed_optimizer:
                 for bucket in self.buckets:
-                    for param in bucket.params:
-                        param_start, param_end = bucket.param_to_index[param]
-                        param_slice = bucket.param_data.view(-1)[param_start:param_end]
-                        param.data.copy_(param_slice.view(param.data.shape))
-                    # All-gathered params are not needed after being copied to param.data.
-                    # Zero out the param buffer (shared with grad buffer) for gradient accumulation.
-                    # We cannot zero out the entire grad buffer because one grad buffer may
-                    # correspond to multiple param buffers. If we zero out the entire grad buffer,
-                    # it would clear the data of those param buffers that have not yet completed AG.
-                    bucket.param_data.zero_()
-            else:
-                fp8_params = []
-                for bucket in self.buckets:
-                    for param in bucket.params:
-                        if is_float8tensor(param):
-                            fp8_params.append(param)
-                if len(fp8_params) > 0:
-                    post_all_gather_processing(fp8_params)
+                    if bucket.layerwise_gather_list is None:
+                        continue
+                    # Unflatten and copy gathered params for each rank.
+                    for idx, params in enumerate(bucket.layerwise_params_list):
+                        # Skip local params and empty tensors.
+                        if (
+                            len(params) == 0
+                            or idx == self.intra_distributed_optimizer_instance_rank
+                        ):
+                            continue
+                        updated_params = _unflatten_dense_tensors(
+                            bucket.layerwise_gather_list[idx], params
+                        )
+                        for updated_p, model_p in zip(updated_params, params):
+                            model_p.data.copy_(updated_p)
+                    bucket.layerwise_gather_list = None
+                    # Zero out grad_data since it was reused as the all-gather
+                    # receive buffer. Without this, accumulation into main_grad
+                    # (a view into grad_data) would start from the result of the
+                    # latest parameter all-gather instead of zero.
+                    bucket.grad_data.zero_()
+            self._post_param_sync()
 
     def start_grad_sync(self, force_all_reduce: Optional[bool] = False):
         """
@@ -375,9 +672,46 @@ class _ParamAndGradBucketGroup:
             # already been dispatched.
             return
 
+        # Drain the predecessor bucket group's reduce-scatter before allocating ours. Only
+        # linked under reduce_scatter_with_fp32_accumulation, which holds an intermediate
+        # all-to-all output tensor pinned until .wait() runs. We only drain when the
+        # predecessor has actually been dispatched this iteration (grad_reduce_handle set):
+        # backward param ordering does not always match bucket linkage order (e.g. NVFP4
+        # bucket layouts), so the predecessor may not have fired yet when we arrive here.
+        # In that case the predecessor will dispatch and drain on its own once its params
+        # become ready. The end-of-step finalize loop still catches any bucket that
+        # neither a successor nor itself drained.
+        if (
+            self.previous_grad_reduce_bucket_group is not None
+            and self.previous_grad_reduce_bucket_group.grad_reduce_handle is not None
+        ):
+            self.previous_grad_reduce_bucket_group.finish_grad_sync(
+                force_all_reduce=force_all_reduce
+            )
+
         assert (
             self.grad_reduce_handle is None
         ), "Should not have multiple communication calls outstanding at once"
+
+        # Local CUDA graph replay is asynchronous with respect to the outer
+        # autograd hooks. Wait before reading, scaling, or reducing gradients
+        # accumulated by a replay into this bucket.
+        current_stream = torch.cuda.current_stream()
+        waited_event_ids = set()
+        for bucket in self.buckets:
+            for param in bucket.params_list:
+                event = getattr(param, "_cudagraph_wgrad_ready_event", None)
+                if event is not None and id(event) not in waited_event_ids:
+                    current_stream.wait_event(event)
+                    waited_event_ids.add(id(event))
+
+        # Copy accumulated .main_grad into communication buffer before collective if
+        # .main_grad is not in .grad_data already (e.g., because we want to do local
+        # gradient accumulation in a higher precision).
+        for bucket in self.buckets:
+            for param in bucket.params_with_extra_main_grads:
+                if getattr(param, 'main_grad_copy_in_grad_buffer', None) is not None:
+                    param.main_grad_copy_in_grad_buffer.copy_(param.main_grad)
 
         if self.ddp_config.check_for_nan_in_grad or self.ddp_config.check_for_large_grads:
             self.check_grads(
@@ -387,9 +721,11 @@ class _ParamAndGradBucketGroup:
 
         # gradient_scaling_factor already takes into account whether we are computing
         # an average or sum in the data-parallel collective.
-        for bucket in self.buckets:
-            if bucket.gradient_scaling_factor != 1.0:
-                bucket.grad_data *= bucket.gradient_scaling_factor
+        # This mutates gradient communication state and must not be tracked by autograd.
+        with torch.no_grad():
+            for bucket in self.buckets:
+                if bucket.gradient_scaling_factor != 1.0:
+                    bucket.grad_data *= bucket.gradient_scaling_factor
 
         # Decide reduce_op.
         reduce_op = torch.distributed.ReduceOp.SUM
@@ -416,10 +752,10 @@ class _ParamAndGradBucketGroup:
             # need to overlap communication.
             stream_context = torch.cuda.stream(self.communication_stream)
 
-            # The RS/AR communication stream needs to wait for the default stream
+            # The RS/AR communication stream needs to wait for the current stream
             # to complete its gradient computation before launching the next
             # gradient reduction collective.
-            self.communication_stream.wait_stream(torch.cuda.default_stream())
+            self.communication_stream.wait_stream(torch.cuda.current_stream())
         else:
             stream_context = nullcontext()
 
@@ -486,7 +822,12 @@ class _ParamAndGradBucketGroup:
                     )
 
         if async_op:
-            if self.ddp_config.reduce_scatter_with_fp32_accumulation and not force_all_reduce:
+            # fp32-accum RS needs the distributed optimizer; else fall through (all-reduce -> cm).
+            if (
+                self.ddp_config.reduce_scatter_with_fp32_accumulation
+                and self.ddp_config.use_distributed_optimizer
+                and not force_all_reduce
+            ):
                 assert (
                     len(self.buckets) == 1
                 ), "Only 1 bucket supported with reduce_scatter_with_fp32_accumulation=True"
@@ -512,11 +853,22 @@ class _ParamAndGradBucketGroup:
         When ddp_config.overlap_grad_reduce is set to True, waits for asynchronous
         communication call to complete. When ddp_config.overlap_grad_reduce is set to False,
         makes synchronous call.
+
+        When ddp_config.overlap_grad_reduce is set to True, this method is idempotent
+        within an iteration: a second call is a no-op. This lets a successor bucket
+        group early-drain its predecessor at dispatch time (see
+        `previous_grad_reduce_bucket_group`) while still allowing the end-of-step
+        finalize loop to call this on every bucket without double-waiting. The
+        non-overlap path preserves its original per-call dispatch+wait behaviour
+        because it has no predecessor draining.
         """
         self.param_gather_dispatched = False
         # If overlap_grad_reduce is False, start (and finish) synchronous communication call here.
         if not self.ddp_config.overlap_grad_reduce:
             self.start_grad_sync(force_all_reduce=force_all_reduce)
+            self._copy_back_extra_main_grads()
+            return
+        if self.grad_reduce_finished:
             return
         # If first batch, start asynchronous communication here. register_grad_ready() launches
         # asynchronous communication only once self.golden_per_param_grad_ready_counts is
@@ -526,7 +878,9 @@ class _ParamAndGradBucketGroup:
         # When using multiple DistOpt instances, we don't need to sync here as we launch
         # communications on a separate communication stream.
         if self.ddp_config.num_distributed_optimizer_instances > 1:
-            torch.cuda.default_stream().wait_stream(self.communication_stream)
+            torch.cuda.current_stream().wait_stream(self.communication_stream)
+            self._copy_back_extra_main_grads()
+            self.grad_reduce_finished = True
             return
         assert self.grad_reduce_handle is not None, (
             f"Communication call has not been issued for this bucket "
@@ -535,6 +889,37 @@ class _ParamAndGradBucketGroup:
         )
         self.grad_reduce_handle.wait()
         self.grad_reduce_handle = None
+        self._copy_back_extra_main_grads()
+        self.grad_reduce_finished = True
+
+    def free_overlap_buffers(self):
+        """Free GPU buffers used by overlap param gather.
+
+        Waits on any pending param all-gather handle, then releases the
+        per-bucket temporary buffers so that the CUDA memory allocator can
+        reclaim them.  Called before async checkpoint saves to avoid OOM in
+        the persistent checkpoint worker process.
+        """
+        if self.param_gather_handle is not None:
+            self.param_gather_handle.wait()
+            self.param_gather_handle = None
+        for bucket in self.buckets:
+            bucket.layerwise_gather_list = None
+
+    def _copy_back_extra_main_grads(self):
+        """
+        Copy reduced gradients from the communication buffer back to .main_grad for
+        params that have a separate higher-precision .main_grad tensor.
+
+        This is needed because the optimizer reads from .main_grad to get the reduced
+        gradients, but for params with extra main_grads, .main_grad points to the local
+        FP32 accumulation tensor rather than the communication buffer where the reduced
+        gradients are stored.
+        """
+        for bucket in self.buckets:
+            for param in bucket.params_with_extra_main_grads:
+                if getattr(param, 'main_grad_copy_in_grad_buffer', None) is not None:
+                    param.main_grad.copy_(param.main_grad_copy_in_grad_buffer)
 
     def register_grad_ready(
         self, param: torch.nn.Parameter, force_all_reduce: Optional[bool] = False
@@ -559,6 +944,123 @@ class _ParamAndGradBucketGroup:
                 if self.per_param_grad_ready_counts == self.golden_per_param_grad_ready_counts:
                     assert len(self.per_param_grad_ready_counts) == len(self.params)
                     self.start_grad_sync(force_all_reduce=force_all_reduce)
+
+
+def group_params_for_buffers(
+    params: List[torch.nn.Parameter], grad_reduce_in_fp32: bool
+) -> Dict['BufferKey', Tuple[List[torch.nn.Parameter], List[int]]]:
+    """Group parameters by buffer identity for buffer allocation.
+
+    Each distinct buffer is identified by a BufferKey with three dimensions:
+    - param_dtype: storage dtype (torch.uint8 for FP8/NVFP4 parameters, else param.dtype).
+    - grad_dtype: gradient reduction dtype (torch.float if grad_reduce_in_fp32, else param.dtype).
+    - is_expert_parallel: whether the parameter uses the expert topology (param.allreduce == False),
+      which requires a separate buffer for the expert data-parallel group. This is true for experts
+      when expert-parallelism > 1, expert-tensor-parallelism != tensor-parallelism, or expert-GTP
+      != GTP.
+
+    The param_indices track each parameter's position among same-dtype params (using
+    the "fake" high-precision dtype for FP8/NVFP4 params), needed for loading non-native-fp8
+    checkpoints in native-fp8 mode.
+
+    Args:
+        params: List of parameters to group.
+        grad_reduce_in_fp32: Whether gradients are reduced in FP32.
+
+    Returns:
+        Dict mapping BufferKey to (params_list, param_indices).
+    """
+    from ..optimizer.param_layout import BufferKey
+
+    key_to_params = {}
+    dtype_to_offsets = {}
+    key_to_indices = {}
+
+    for param in params:
+        assert param.requires_grad
+
+        param_dtype = param.dtype
+        if _param_uses_quantized_storage(param):
+            param_dtype = torch.uint8
+        grad_dtype = torch.float if grad_reduce_in_fp32 else param.dtype
+        is_expert_parallel = not getattr(param, 'allreduce', True)
+        is_managed_by_layer_wise_optimizer = getattr(
+            param, 'is_managed_by_layer_wise_optimizer', False
+        )
+
+        key = BufferKey(
+            param_dtype, grad_dtype, is_expert_parallel, is_managed_by_layer_wise_optimizer
+        )
+        param_list = key_to_params.get(key, [])
+        param_list.append(param)
+        key_to_params[key] = param_list
+
+        # Use param.dtype (not param_dtype) so FP8/NVFP4 params share offsets with their
+        # logical high-precision dtype, needed for checkpoint compatibility.
+        offset_key = BufferKey(
+            param.dtype, grad_dtype, is_expert_parallel, is_managed_by_layer_wise_optimizer
+        )
+        offset = dtype_to_offsets.get(offset_key, 0)
+        dtype_to_offsets[offset_key] = offset + 1
+        indices = key_to_indices.get(key, [])
+        indices.append(offset)
+        key_to_indices[key] = indices
+
+    result = {}
+    for key, param_list in key_to_params.items():
+        result[key] = (param_list, key_to_indices[key])
+    return result
+
+
+def _compute_default_per_buffer_param_layout(
+    params: List[torch.nn.Parameter], bucket_size: Optional[int]
+) -> 'PerBufferParamLayout':
+    """Compute parameter layout for the non-distributed-optimizer case.
+
+    No padding is applied. Parameters are iterated in reverse order (backprop order)
+    and grouped into buckets of approximately `bucket_size` elements.
+
+    Args:
+        params: List of parameters to lay out.
+        bucket_size: Approximate number of elements per bucket, or None for a single bucket.
+
+    Returns:
+        PerBufferParamLayout with the computed mapping.
+    """
+    from ..optimizer.param_layout import PerBufferParamLayout
+
+    param_index_map = {}
+    bucket_indices = []
+    per_bucket_numel_unpadded = []
+
+    param_start_index = 0
+    bucket_start_index = 0
+    bucket_params = set()
+    bucket_id = 0
+
+    for param in params[::-1]:
+        this_numel = param.data.nelement()
+        param_end_index = param_start_index + this_numel
+        param_index_map[param] = (param_start_index, param_end_index, bucket_id)
+        bucket_params.add(param)
+
+        if bucket_size is not None and (param_end_index - bucket_start_index) >= bucket_size:
+            per_bucket_numel_unpadded.append(param_end_index - bucket_start_index)
+            bucket_indices.append((bucket_start_index, param_end_index))
+            bucket_start_index = param_end_index
+            bucket_params = set()
+            bucket_id += 1
+        param_start_index = param_end_index
+
+    if len(bucket_params) > 0:
+        per_bucket_numel_unpadded.append(param_end_index - bucket_start_index)
+        bucket_indices.append((bucket_start_index, param_end_index))
+
+    return PerBufferParamLayout(
+        param_index_map=param_index_map,
+        bucket_indices=bucket_indices,
+        per_bucket_numel_unpadded=per_bucket_numel_unpadded,
+    )
 
 
 class _ParamAndGradBuffer:
@@ -588,7 +1090,7 @@ class _ParamAndGradBuffer:
         ddp_config: DistributedDataParallelConfig,
         param_dtype: torch.dtype,
         grad_dtype: torch.dtype,
-        params: List[torch.nn.Parameter],
+        params_with_names: List[Tuple[torch.nn.Parameter, str]],
         data_parallel_group: torch.distributed.ProcessGroup,
         bucket_size: int,
         param_to_name: Dict[torch.nn.Parameter, str],
@@ -596,6 +1098,7 @@ class _ParamAndGradBuffer:
         param_indices: List[int],
         nccl_ub: bool,
         pg_collection: Optional[ProcessGroupCollection] = None,
+        param_layout: Optional['PerBufferParamLayout'] = None,
     ):
 
         if pg_collection is None:
@@ -608,13 +1111,27 @@ class _ParamAndGradBuffer:
             self.dp_cp_group = pg_collection.dp_cp
             self.tp_group = pg_collection.tp
 
+        # Pick the single rank per module that logs this buffer's layout. Every GTP-remat
+        # peer holds a replica of the buffer, so requiring tp and dp_cp rank 0 alone still
+        # leaves one emitter per weight shard. Both GTP axes are absent when GTP-remat is
+        # inactive, and a MIMO vision encoder owns neither.
+        log_dedup_groups = [
+            self.tp_group,
+            self.dp_cp_group,
+            getattr(pg_collection, 'gtp_remat', None),
+            getattr(pg_collection, 'expt_gtp_remat', None),
+        ]
+        self.is_buffer_log_rank = all(
+            group.rank() == 0 for group in log_dedup_groups if group is not None
+        )
+
         self.ddp_config = ddp_config
-        self.params = params
+        self.params = [param for (param, _) in params_with_names]
         self.param_indices = param_indices
 
         # Check that params are unique.
         unique_params = set()
-        for param in params:
+        for param, _ in params_with_names:
             assert param not in unique_params
             unique_params.add(param)
         del unique_params
@@ -630,147 +1147,103 @@ class _ParamAndGradBuffer:
         # Data structures to store underlying buckets and relevant indexing data.
         self.buckets = []
         self.param_to_bucket = {}  # Param -> bucket mapping.
-        self.param_index_map = {}  # Param -> location in buffer mapping (used in dist. optimizer).
 
-        def _pad(number_to_be_padded: int, divisor: int) -> int:
-            return int(math.ceil(number_to_be_padded / divisor) * divisor)
+        # Use the provided layout if given, otherwise compute the default (no-padding) layout.
+        if param_layout is None:
+            param_layout = _compute_default_per_buffer_param_layout(self.params, bucket_size)
+        self.param_index_map = param_layout.param_index_map
+        self.bucket_indices = param_layout.bucket_indices
+        self.num_optimizer_shards = param_layout.num_optimizer_shards
+        per_bucket_numel_unpadded = param_layout.per_bucket_numel_unpadded
 
-        def _pad_end_of_bucket_if_needed(bucket_end_index: int) -> int:
-            """
-            Pads end index of bucket if using distributed optimizer (to ensure uniform sharding).
-            """
-            if self.ddp_config.use_distributed_optimizer:
-                # Workaround for TE bug causing cuBLAS to pick an incompatible algorithm.
-                # This also helps cuBLAS pick more efficient algorithms for GEMMs.
-                # We now ensure that all buckets start at a memory address that is 256-byte
-                # aligned (128 values since params and grads use >= 16-bit precision).
-                if self.ddp_config.pad_buckets_for_high_nccl_busbw:
-                    # Make sure the bucket size is divisible by a large power of 2 (2^16) to
-                    # ensure NCCL collectives have high bus bandwidth at large DP counts,
-                    # since NCCL message size (which for ring algorithms is bucket_size /
-                    # dp_size) apparently needs to be divisible by a power of 2 for high busbw.
-                    bucket_size_divisor = math.lcm(self.data_parallel_world_size, 128, 2**16)
-                else:
-                    bucket_size_divisor = math.lcm(self.data_parallel_world_size, 128)
-                return _pad(bucket_end_index, bucket_size_divisor)
-            return bucket_end_index
-
-        def _pad_start_of_param_if_needed(param_start_index: int) -> int:
-            """
-            Pads start index of param if using distributed optimizer (to ensure "good" alignment).
-            """
-            if self.ddp_config.use_distributed_optimizer:
-                # Ensure that params start at 128-byte aligned addresses (64 values
-                # since params are >= 16-bit precision).
-                return _pad(param_start_index, 64)
-            return param_start_index
-
-        # First, figure out how many elements should be in the underlying buffer storage.
-        # Note that if we need to split the buffer into smaller buckets, each of these
-        # might need to be padded as well (if using the distributed optimizer).
-        param_start_index = 0
-        bucket_start_index = param_start_index
-        bucket_params = set()
-        self.bucket_indices = []
-        per_bucket_numel_unpadded = []
-        bucket_id = 0
-
-        def _update_bucket_metadata(param_end_index: int) -> int:
-            """
-            Record metadata for the bucket starting at bucket_start_index and ending with the
-            passed-in param_end_index. Returns the bucket's end_index.
-            """
-            nonlocal bucket_start_index, bucket_params, bucket_id
-            per_bucket_numel_unpadded.append(param_end_index - bucket_start_index)
-            bucket_end_index = _pad_end_of_bucket_if_needed(param_end_index)
-
-            # Record metadata of new bucket.
-            self.bucket_indices.append((bucket_start_index, bucket_end_index))
-            bucket_start_index = bucket_end_index
-
-            # Prepare for next bucket.
-            bucket_params = set()
-            bucket_id += 1
-
-            # Return the potentially padded bucket_end_index.
-            return bucket_end_index
-
-        def _does_param_require_new_bucket(param):
-            """
-            Split shared embedding parameters into separate bucket if using distributed
-            optimizer that makes use of reduce-scatters instead of all-reduces.
-            This ensures that the first and last pipeline stage partition optimizer state
-            for the shared embedding parameters the same way across DP replicas, allowing
-            the DP reduce-scatter to be before the embedding all-reduce.
-            """
-            return (
-                getattr(param, "shared_embedding", False)
-                and self.ddp_config.use_distributed_optimizer
-            )
-
-        for param in params[::-1]:
-            # Iterate through parameters in reverse order to roughly follow backprop order.
-
-            this_numel = param.data.nelement()
-            param_start_index = _pad_start_of_param_if_needed(param_start_index)
-
-            # Create bucket with collected parameters if current param needs its own bucket.
-            if _does_param_require_new_bucket(param) and len(bucket_params) > 0:
-                # Ensure this param accounts for the new padding introduced at end of
-                # previous bucket.
-                param_start_index = _update_bucket_metadata(param_start_index)
-
-            param_end_index = param_start_index + this_numel
-            self.param_index_map[param] = (param_start_index, param_end_index, bucket_id)
-            bucket_params.add(param)
-
-            # If we have enough elements already or the current param is part of the shared
-            # embedding layer and needs a separate bucket, form a new bucket.
-            if (
-                bucket_size is not None and (param_end_index - bucket_start_index) >= bucket_size
-            ) or _does_param_require_new_bucket(param):
-                bucket_end_index = _update_bucket_metadata(param_end_index)
-                param_start_index = bucket_end_index
-            else:
-                param_start_index = param_end_index
-
-        # Add remaining params to a new bucket.
-        if len(bucket_params) > 0:
-            bucket_end_index = _update_bucket_metadata(param_end_index)
+        # Check if this buffer contains NVFP4 params.
+        #
+        # NVFP4 uses a dual-buffer layout: the param buffer stores packed bytes (half the
+        # logical numel) while the grad buffer uses the full numel. This is because NVFP4
+        # packs two FP4 values into a single uint8 byte for storage/communication, but
+        # gradients are computed and reduced in BF16 at full element count.
+        #
+        #   Logical view:  [v0, v1, v2, v3, ...]   numel = N
+        #
+        #   Param buffer  (uint8):      [byte0, byte1, ...]      numel = N // 2
+        #                                 ^^^^^ packs v0+v1
+        #
+        #   Grad buffer:  [g0, g1, g2, g3, ...]   numel = N
+        #
+        # We therefore maintain two index maps:
+        #   - param_index_map:              offsets using full numel (from pre-computed layout).
+        #   - nvfp4_packed_param_index_map: offsets into the packed param buffer (numel // 2).
+        #
+        # The packed index map is derived from param_index_map by iterating through
+        # the already-computed layout and halving numel for NVFP4 tensors.
+        #
+        self.has_nvfp4_params = any(
+            is_nvfp4tensor(p) or is_grouped_nvfp4tensor(p) for p in self.params
+        )
+        self.nvfp4_packed_param_index_map = None
+        self.nvfp4_packed_bucket_indices = None
+        if self.has_nvfp4_params:
+            self._compute_nvfp4_packed_layout(params_with_names)
 
         # Next, create underlying storage for buffer (with numel elements that includes
         # padding as necessary).
-        self.numel = bucket_end_index
+        self.numel = self.bucket_indices[-1][1]
         self.numel_unpadded = sum(per_bucket_numel_unpadded)
+        if self.has_nvfp4_params:
+            self.nvfp4_packed_numel = self.nvfp4_packed_bucket_indices[-1][1]
+            # nvfp4_packed_numel_unpadded is already set by _compute_nvfp4_packed_layout.
+
         assert self.numel_unpadded <= self.numel
+        if self.has_nvfp4_params:
+            assert self.nvfp4_packed_numel_unpadded <= self.nvfp4_packed_numel
         if self.ddp_config.use_distributed_optimizer:
             assert self.numel % self.data_parallel_world_size == 0
+            if self.has_nvfp4_params:
+                assert self.nvfp4_packed_numel % self.data_parallel_world_size == 0
         else:
             assert self.numel == self.numel_unpadded
 
         self.param_data = None
+        self.grad_data = None
+        self.extra_main_grads = []
+        self.nccl_mem_pool: Optional["torch.cuda.MemPool"] = None
+        self.param_nccl_mem_pool: Optional["torch.cuda.MemPool"] = None
+        self.nccl_grad_pool_is_separate: bool = self.nccl_ub and self.ddp_config.grad_buffer_offload
+        uses_shared_param_grad_buffer = self.ddp_config.use_distributed_optimizer and any(
+            is_mxfp8tensor(p) or is_grouped_mxfp8tensor(p) for p in self.params
+        )
+        if self.ddp_config.grad_buffer_offload and uses_shared_param_grad_buffer:
+            raise ValueError(
+                "Gradient-buffer offload is incompatible with MXFP8 parameters because "
+                "parameter and gradient data share storage."
+            )
 
         if self.nccl_ub:
             # If nccl_ub is True, use nccl_allocator to allocate memory for param_data/grad_data.
             nccl_allocator.init()
-            pool = nccl_allocator.create_nccl_mem_pool(
+            self.nccl_mem_pool = nccl_allocator.create_nccl_mem_pool(
                 symmetric=not self.ddp_config.disable_symmetric_registration
             )
             mem_alloc_context = functools.partial(
                 nccl_allocator.nccl_mem,
-                pool,
+                self.nccl_mem_pool,
                 group=self.data_parallel_group,
                 symmetric=not self.ddp_config.disable_symmetric_registration,
             )
+            # Since nccl communicator group is created lazily, we need to perform a warmup call to
+            # initialize NCCL comm buffers for this dp_group before doing buffer registration.
+            torch.distributed.barrier()
+            tmp_warmup_tensor = torch.zeros([1], device="cuda")
+            torch.distributed.all_reduce(tmp_warmup_tensor, group=self.data_parallel_group)
+            torch.distributed.barrier()
         else:
-            # If nccl_ub is False, mem_alloc_context is nullcontext.
+            # If nccl_ub is False, the allocation context is nullcontext.
             mem_alloc_context = nullcontext
 
-        with mem_alloc_context():
-            # For MXFP8 param: Create a shared buffer for param AG and grad RS for memory efficiency
-            # The buffer is mapped to weight gradients whose dtype is either bf16 or FP32.
-            # It can be temporarily reused by param AG.
-            if self.ddp_config.use_distributed_optimizer and any(is_mxfp8tensor(p) for p in params):
+        if uses_shared_param_grad_buffer:
+            # MXFP8 parameter all-gather and gradient reduce-scatter share this storage.
+            # Offload-capable layouts reject this case above.
+            with mem_alloc_context():
                 self.shared_buffer = torch.zeros(
                     self.numel,
                     dtype=self.grad_dtype,
@@ -785,15 +1258,18 @@ class _ParamAndGradBuffer:
                 else:
                     self.param_data = self.shared_buffer
                 self.grad_data = self.shared_buffer
-            else:
-                # Only re-map param tensors if using distributed optimizer.
-                if self.ddp_config.use_distributed_optimizer:
-                    self.param_data = torch.zeros(
-                        self.numel,
-                        dtype=self.param_dtype,
-                        device=torch.cuda.current_device(),
-                        requires_grad=False,
-                    )
+        else:
+
+            def allocate_param_buffer() -> None:
+                numel = self.nvfp4_packed_numel if self.has_nvfp4_params else self.numel
+                self.param_data = torch.zeros(
+                    numel,
+                    dtype=self.param_dtype,
+                    device=torch.cuda.current_device(),
+                    requires_grad=False,
+                )
+
+            def allocate_grad_buffer() -> None:
                 self.grad_data = torch.zeros(
                     self.numel,
                     dtype=self.grad_dtype,
@@ -801,93 +1277,361 @@ class _ParamAndGradBuffer:
                     requires_grad=False,
                 )
 
+            # Offload-capable NCCL UBR keeps parameter storage in a persistent pool and
+            # gradient storage in a replaceable pool. Other layouts retain their existing
+            # single allocation/registration context.
+            if self.nccl_grad_pool_is_separate:
+                # nccl_mem suppresses registration RuntimeError. That fallback is unsafe for
+                # a replaceable pool: the first offload would try to deregister a pool that was
+                # never registered. Register this new lifecycle explicitly and fail construction
+                # before creating the persistent parameter pool if registration does not succeed.
+                with torch.cuda.use_mem_pool(self.nccl_mem_pool):
+                    allocate_grad_buffer()
+                self._register_nccl_mem_pool(self.nccl_mem_pool)
+                if self.ddp_config.use_distributed_optimizer:
+                    try:
+                        # Create the persistent parameter pool only after the replaceable gradient
+                        # pool has registered successfully, so either failure can be rolled back.
+                        self.param_nccl_mem_pool = nccl_allocator.create_nccl_mem_pool(
+                            symmetric=not self.ddp_config.disable_symmetric_registration
+                        )
+                        with torch.cuda.use_mem_pool(self.param_nccl_mem_pool):
+                            allocate_param_buffer()
+                        self._register_nccl_mem_pool(self.param_nccl_mem_pool)
+                    except RuntimeError:
+                        # The gradient pool was registered first. Roll it back before its storage
+                        # can be released while PyTorch still associates the pool with this group.
+                        self._deregister_nccl_mem_pool_after_error(self.nccl_mem_pool)
+                        raise
+            else:
+                with mem_alloc_context():
+                    if self.ddp_config.use_distributed_optimizer:
+                        allocate_param_buffer()
+                    allocate_grad_buffer()
+
         self.grad_data_size = 0
         self.param_data_size = 0
         self.param_data_cpu = None
 
         # Finally, map param.data and param.main_grad fields to buffers.
-        bucket_params = []
-        bucket_start_index = 0
-        cur_bucket_id = 0
-        for param in params[::-1]:
-            param_start_index, param_end_index, bucket_id = self.param_index_map[param]
-            # For MXFP8 param: we only need to map weight gradients to the buffer.
-            if not self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag:
-                # Assign param.data to appropriate segment of self.param_data.
-                if self.param_data is not None:
-                    new_param_data = self._get(
-                        param.data.shape, param_start_index, buffer_type=BufferType.PARAM
-                    )
-                    if is_float8tensor(param):
-                        modify_underlying_storage(param, new_param_data)
-                    else:
-                        old_param_data = param.data
-                        param.data = new_param_data
-                        assert old_param_data._base is None
-                        # Copy tensor values (from initialization or checkpoint).
-                        param.data.detach().copy_(old_param_data)
-                        del old_param_data
+        def _create_bucket(bucket_id, bucket_params, bucket_params_with_extra_main_grads):
+            """
+            Look up precomputed bucket indices and create a new bucket.
 
+            Args:
+                bucket_id: ID of the bucket to create.
+                bucket_params: List of parameters in this bucket.
+                bucket_params_with_extra_main_grads: List of parameters with
+                    extra FP32 main_grads.
+
+            Returns:
+                A new _ParamAndGradBucket instance.
+            """
+            bucket_start_index, bucket_end_index = self.bucket_indices[bucket_id]
+            if self.has_nvfp4_params:
+                nvfp4_packed_start_index, nvfp4_packed_end_index = self.nvfp4_packed_bucket_indices[
+                    bucket_id
+                ]
+            else:
+                nvfp4_packed_start_index, nvfp4_packed_end_index = None, None
+            return self._new_bucket(
+                bucket_params=bucket_params,
+                start_index=bucket_start_index,
+                end_index=bucket_end_index,
+                numel_unpadded=per_bucket_numel_unpadded[bucket_id],
+                bucket_id=bucket_id,
+                nvfp4_packed_start_index=nvfp4_packed_start_index,
+                nvfp4_packed_end_index=nvfp4_packed_end_index,
+                bucket_params_with_extra_main_grads=bucket_params_with_extra_main_grads,
+            )
+
+        bucket_params = []
+        bucket_params_with_extra_main_grads = []
+        cur_bucket_id = 0
+        for param, param_name in params_with_names[::-1]:
+            # Get parameter indices computed in previous loop.
+            param_start_index, param_end_index, bucket_id = self.param_index_map[param]
+            nvfp4_packed_param_start_index = None
+            if self.has_nvfp4_params:
+                nvfp4_packed_param_start_index, _, _ = self.nvfp4_packed_param_index_map[param]
+            # This branch remaps the parameter storage into persistent DDP param_data buffer.
+            #
+            # Enter when:
+            # - `reuse_grad_buf_for_mxfp8_param_ag` is off: param AG has a persistent
+            #   param_data buffer instead of sharing storage with grad_data,
+            #   so every parameter must be backed by param_data.
+            # - param is not quantized: BF16/FP16/plain params still need persistent
+            #   param_data even when quantized params use grad_data as temporary AG storage.
+            #
+            # Skip only when both are true: AG reuses grad_data and the param is quantized.
+            # In that case AG writes into grad_data, then _post_param_sync copies the
+            # gathered values back into TE quantized storage.
+            #
+            # Remap cases below:
+            #   non-grouped TE NVFP4 tensor   -> remap packed rowwise bytes
+            #   non-grouped TE quantized      -> remap TE quantized storage
+            #   regular torch.Tensor param    -> replace param.data with param_data view
+            #   TE GroupedTensor + NVFP4      -> remap packed rowwise bytes
+            #   TE GroupedTensor + MXFP8      -> unsupported here; require grad-buffer AG reuse
+            #   TE GroupedTensor + BF16/FP16  -> remap grouped rowwise_data
+            if (
+                not self.ddp_config.reuse_grad_buf_for_mxfp8_param_ag
+                or not _param_uses_quantized_storage(param)
+            ):
+                if self.param_data is not None:
+                    if not is_grouped_tensor(param):
+                        # Plain NVFP4: remap packed rowwise bytes only.
+                        if is_nvfp4tensor(param):
+                            packed_shape = get_nvfp4_rowwise_packed_shape(param.data.shape)
+                            rowwise_bytes_view = self._get(
+                                packed_shape,
+                                nvfp4_packed_param_start_index,
+                                buffer_type=BufferType.PARAM,
+                            )
+                            modify_nvfp4_rowwise_storage(param, rowwise_bytes_view)
+                        # In TE2, is_float8tensor() checks QuantizedTensor, including MXFP8.
+                        # NVFP4 is handled by the branch above.
+                        elif is_float8tensor(param):
+                            # NVFP4 packs two FP4 values per byte, so param_data uses
+                            # packed-byte offsets instead of logical element offsets.
+                            new_param_data = self._get(
+                                param.data.shape,
+                                (
+                                    nvfp4_packed_param_start_index
+                                    if self.has_nvfp4_params
+                                    else param_start_index
+                                ),
+                                buffer_type=BufferType.PARAM,
+                            )
+                            modify_underlying_storage(param, new_param_data)
+                        # Plain torch param: replace param.data with DDP buffer view.
+                        else:
+                            # NVFP4 packs two FP4 values per byte, so param_data uses
+                            # packed-byte offsets instead of logical element offsets.
+                            new_param_data = self._get(
+                                param.data.shape,
+                                (
+                                    nvfp4_packed_param_start_index
+                                    if self.has_nvfp4_params
+                                    else param_start_index
+                                ),
+                                buffer_type=BufferType.PARAM,
+                            )
+                            old_param_data = param.data
+                            param.data = new_param_data
+                            assert old_param_data._base is None
+                            # Copy tensor values (from initialization or checkpoint).
+                            param.data.detach().copy_(old_param_data)
+                            del old_param_data
+                    else:
+                        # GroupedTensor: preserve wrapper/metadata; remap backing storage only.
+                        # Grouped NVFP4: only rowwise bytes live in DDP param_data.
+                        if is_grouped_nvfp4tensor(param):
+                            packed_shape = get_nvfp4_rowwise_packed_shape(param.data.shape)
+                            rowwise_bytes_view = self._get(
+                                packed_shape,
+                                nvfp4_packed_param_start_index,
+                                buffer_type=BufferType.PARAM,
+                            )
+                            modify_grouped_nvfp4_rowwise_storage(param, rowwise_bytes_view)
+                            rowwise_data = getattr(param, "rowwise_data", None)
+                            if (
+                                rowwise_data is None
+                                or rowwise_data.data_ptr() != rowwise_bytes_view.view(-1).data_ptr()
+                            ):
+                                raise RuntimeError(
+                                    "Failed to remap grouped NVFP4 rowwise storage into DDP "
+                                    "param_data."
+                                )
+                        # Grouped MXFP8: do not remap grouped quantized storage into param_data.
+                        # Use grad-buffer AG reuse and copy gathered values back after AG.
+                        elif is_grouped_mxfp8tensor(param):
+                            raise RuntimeError(
+                                "Single grouped MXFP8 params require "
+                                "--reuse-grad-buf-for-mxfp8-param-ag."
+                            )
+                        elif is_grouped_tensor_with_quantized_storage(param):
+                            raise RuntimeError(
+                                "Unsupported single grouped quantized parameter recipe."
+                            )
+                        # Grouped BF16/FP16: remap full rowwise_data.
+                        else:
+                            # NVFP4 packs two FP4 values per byte, so param_data uses
+                            # packed-byte offsets instead of logical element offsets.
+                            new_param_data = self._get(
+                                param.data.shape,
+                                (
+                                    nvfp4_packed_param_start_index
+                                    if self.has_nvfp4_params
+                                    else param_start_index
+                                ),
+                                buffer_type=BufferType.PARAM,
+                            )
+                            modify_grouped_tensor_rowwise_storage(param, new_param_data)
+                            rowwise_data = getattr(param, "rowwise_data", None)
+                            if (
+                                rowwise_data is None
+                                or rowwise_data.data_ptr() != new_param_data.view(-1).data_ptr()
+                            ):
+                                raise RuntimeError(
+                                    "Failed to remap high-precision TE GroupedTensor parameter "
+                                    "storage into DDP param_data."
+                                )
+
+            # Grad buffer always uses full-numel offsets from param_index_map.
             param.main_grad = self._get(
                 param.data.shape, param_start_index, buffer_type=BufferType.GRAD
             )
+            # Create FP32 copy of .main_grads if necessary.
+            promote_main_grads_to_higher_precision = False
+            for param_name_pattern in ddp_config.param_name_patterns_for_fp32_local_accumulation:
+                if fnmatch.fnmatch(param_name, param_name_pattern) or param_name_pattern == 'all':
+                    if self.is_buffer_log_rank:
+                        logger.info(
+                            f"Matched {param_name} with '{param_name_pattern}'; promoting "
+                            f"main_grad.type from {param.main_grad.dtype} to torch.float32!"
+                        )
+                    promote_main_grads_to_higher_precision = True
+                    break
+            if promote_main_grads_to_higher_precision:
+                param.main_grad_copy_in_grad_buffer = (
+                    param.main_grad
+                )  # Slice into .grad_data buffer.
+                param.main_grad = torch.empty_like(param.main_grad, dtype=torch.float32)
+                self.extra_main_grads.append(param.main_grad)
+
             if bucket_id != cur_bucket_id:
-                bucket_end_index = _pad_end_of_bucket_if_needed(param_start_index)
                 self.buckets.append(
-                    self._new_bucket(
-                        bucket_params=bucket_params,
-                        start_index=bucket_start_index,
-                        end_index=bucket_end_index,
-                        numel_unpadded=per_bucket_numel_unpadded[cur_bucket_id],
-                        bucket_id=cur_bucket_id,
+                    _create_bucket(
+                        cur_bucket_id, bucket_params, bucket_params_with_extra_main_grads
                     )
                 )
-                bucket_start_index = bucket_end_index
                 bucket_params = []
+                bucket_params_with_extra_main_grads = []
                 assert cur_bucket_id + 1 == len(self.buckets)
                 assert bucket_id == cur_bucket_id + 1
                 cur_bucket_id = bucket_id
+
             bucket_params.append(param)
+            if promote_main_grads_to_higher_precision:
+                bucket_params_with_extra_main_grads.append(param)
 
         # Add remaining params to a new bucket.
         if len(bucket_params) > 0:
-            bucket_end_index = _pad_end_of_bucket_if_needed(param_end_index)
             self.buckets.append(
-                self._new_bucket(
-                    bucket_params=bucket_params,
-                    start_index=bucket_start_index,
-                    end_index=bucket_end_index,
-                    numel_unpadded=per_bucket_numel_unpadded[cur_bucket_id],
-                    bucket_id=cur_bucket_id,
-                )
+                _create_bucket(cur_bucket_id, bucket_params, bucket_params_with_extra_main_grads)
             )
-
         # Log buckets for all PP stages.
-        log_strs = []
-        log_strs.append(
-            f"Number of buckets for gradient all-reduce / reduce-scatter: {len(self.buckets)}"
-        )
-        for index, bucket in enumerate(self.buckets):
-            numel = 0
-            for param in bucket.params:
-                numel += param.data.nelement()
+        if logger.isEnabledFor(logging.INFO) and self.is_buffer_log_rank:
+            log_strs = []
             log_strs.append(
-                f"Params for bucket {index + 1} ({numel} elements, "
-                f"{bucket.grad_data.nelement()} padded size):"
+                f"Number of buckets for gradient all-reduce / reduce-scatter: {len(self.buckets)}"
             )
-            for param in bucket.params:
-                log_strs.append(f"\t{param_to_name[param]}")
-        log_on_each_pipeline_stage(
-            logger,
-            logging.INFO,
-            "\n".join(log_strs),
-            tp_group=self.tp_group,
-            dp_cp_group=self.dp_cp_group,
+            for index, bucket in enumerate(self.buckets):
+                numel = 0
+                for param in bucket.params_list:
+                    numel += param.data.nelement()
+                log_strs.append(
+                    f"Params for bucket {index + 1} ({numel} elements, "
+                    f"{bucket.grad_data.nelement()} padded size, "
+                    f"{len(bucket.params_with_extra_main_grads)} param(s) with extra main_grads):"
+                )
+                for param in bucket.params_list:
+                    log_strs.append(f"\t{param_to_name[param]} ({param.main_grad.dtype=})")
+            logger.info("\n".join(log_strs))
+
+    def _compute_nvfp4_packed_layout(self, params_with_names):
+        """Derive packed NVFP4 index map and bucket indices from the primary layout.
+
+        The primary layout (self.param_index_map, self.bucket_indices) uses full numel
+        for all params. NVFP4 tensors pack two FP4 values into one byte, so the param
+        buffer needs a separate "packed" index map where NVFP4 params occupy half the
+        space. Non-NVFP4 params keep their full numel in the packed space.
+
+        The same padding rules used by the primary layout are applied here:
+        - 64-element alignment at the start of each param.
+        - Bucket-end padding for DP-divisibility (when using distributed optimizer).
+
+        Sets:
+            self.nvfp4_packed_param_index_map: param -> (start, end, bucket_id)
+            self.nvfp4_packed_bucket_indices: list of (start, end) per bucket
+            self.nvfp4_packed_numel_unpadded: total unpadded elements across all buckets
+        """
+
+        def _pad_start_of_param(param_start_index: int) -> int:
+            if self.ddp_config.use_distributed_optimizer:
+                return pad_param_start(param_start_index)
+            return param_start_index
+
+        def _pad_end_of_bucket(bucket_end_index: int) -> int:
+            if self.ddp_config.use_distributed_optimizer:
+                return pad_bucket_end(
+                    bucket_end_index,
+                    self.data_parallel_world_size,
+                    self.ddp_config.pad_buckets_for_high_nccl_busbw,
+                )
+            return bucket_end_index
+
+        self.nvfp4_packed_param_index_map = {}
+        self.nvfp4_packed_bucket_indices = []
+        nvfp4_packed_per_bucket_numel_unpadded = []
+
+        packed_param_start = 0
+        packed_bucket_start = 0
+        cur_bucket_id = 0
+
+        for param, _ in params_with_names[::-1]:
+            _, _, bucket_id = self.param_index_map[param]
+            param_numel = param.data.nelement()
+
+            packed_param_start = _pad_start_of_param(packed_param_start)
+
+            # Finalize previous bucket if we've moved to a new one.
+            if bucket_id != cur_bucket_id:
+                # Record unpadded numel, then pad the bucket end.
+                nvfp4_packed_per_bucket_numel_unpadded.append(
+                    packed_param_start - packed_bucket_start
+                )
+                packed_bucket_end = _pad_end_of_bucket(packed_param_start)
+                self.nvfp4_packed_bucket_indices.append((packed_bucket_start, packed_bucket_end))
+                packed_bucket_start = packed_bucket_end
+                packed_param_start = packed_bucket_start
+                cur_bucket_id = bucket_id
+
+            # NVFP4 tensors use half the numel in the packed param buffer.
+            if is_nvfp4tensor(param) or is_grouped_nvfp4tensor(param):
+                assert (
+                    param_numel % 2 == 0
+                ), f"NVFP4 requires even numel for packing, got {param_numel}"
+                packed_numel = param_numel // 2
+            else:
+                packed_numel = param_numel
+
+            packed_param_end = packed_param_start + packed_numel
+            self.nvfp4_packed_param_index_map[param] = (
+                packed_param_start,
+                packed_param_end,
+                bucket_id,
+            )
+            packed_param_start = packed_param_end
+
+        # Finalize last bucket.
+        if packed_param_start > packed_bucket_start:
+            nvfp4_packed_per_bucket_numel_unpadded.append(packed_param_start - packed_bucket_start)
+            packed_bucket_end = _pad_end_of_bucket(packed_param_start)
+            self.nvfp4_packed_bucket_indices.append((packed_bucket_start, packed_bucket_end))
+
+        assert len(self.nvfp4_packed_bucket_indices) == len(self.bucket_indices), (
+            f"Packed bucket count ({len(self.nvfp4_packed_bucket_indices)}) != "
+            f"primary bucket count ({len(self.bucket_indices)})"
         )
+        self.nvfp4_packed_numel_unpadded = sum(nvfp4_packed_per_bucket_numel_unpadded)
 
     def scale_gradients(self, scaling_factor: float) -> None:
         """Scale the gradient data by `scaling_factor`."""
         self.grad_data *= scaling_factor
+        for grad in self.extra_main_grads:
+            grad *= scaling_factor
 
     def _get(self, shape: torch.Size, start_index: int, buffer_type: BufferType) -> torch.Tensor:
         """
@@ -895,11 +1639,13 @@ class _ParamAndGradBuffer:
         `start_index`.
         """
         end_index = start_index + shape.numel()
-        assert end_index <= self.numel, "Requested tensor is out of buffer range"
         if buffer_type == BufferType.PARAM:
+            numel = self.nvfp4_packed_numel if self.has_nvfp4_params else self.numel
+            assert end_index <= numel, "Requested tensor is out of param buffer range"
             assert self.param_data is not None
             buffer_tensor = self.param_data[start_index:end_index]
         elif buffer_type == BufferType.GRAD:
+            assert end_index <= self.numel, "Requested tensor is out of grad buffer range"
             buffer_tensor = self.grad_data[start_index:end_index]
         else:
             raise Exception("Illegal buffer type provided to GradBuffer._get() function")
@@ -913,24 +1659,47 @@ class _ParamAndGradBuffer:
         end_index: int,
         numel_unpadded: int,
         bucket_id: int,
+        bucket_params_with_extra_main_grads: List[torch.Tensor],
+        nvfp4_packed_start_index: int = None,
+        nvfp4_packed_end_index: int = None,
     ) -> _ParamAndGradBucket:
         """
         Helper function that creates a new bucket. Also updates param->bucket mapping.
+
+        For NVFP4 buffers, nvfp4_packed_start_index and nvfp4_packed_end_index
+        are provided separately because the param buffer uses packed numel while
+        the grad buffer uses full numel.
         """
 
         # Assert that indices are correctly padded (if needed), and that bucket
         # position is same as originally computed.
+
         if self.ddp_config.use_distributed_optimizer:
             assert start_index % self.data_parallel_world_size == 0
             assert end_index % self.data_parallel_world_size == 0
         assert (start_index, end_index) == self.bucket_indices[bucket_id]
+        if nvfp4_packed_start_index is not None:
+            assert (
+                nvfp4_packed_start_index,
+                nvfp4_packed_end_index,
+            ) == self.nvfp4_packed_bucket_indices[bucket_id]
 
         # Get appropriate view into global _ParamAndGradBuffer.
+        # For NVFP4, param buffer uses packed offsets; otherwise same as start/end.
         bucketed_param_data = None
         if self.param_data is not None:
-            bucketed_param_data = self._get(
-                torch.Size([end_index - start_index]), start_index, buffer_type=BufferType.PARAM
-            )
+            if nvfp4_packed_start_index is not None:
+                assert nvfp4_packed_end_index is not None
+                bucketed_param_data = self._get(
+                    torch.Size([nvfp4_packed_end_index - nvfp4_packed_start_index]),
+                    nvfp4_packed_start_index,
+                    buffer_type=BufferType.PARAM,
+                )
+            else:
+                bucketed_param_data = self._get(
+                    torch.Size([end_index - start_index]), start_index, buffer_type=BufferType.PARAM
+                )
+        # Grad buffer always uses full-numel offsets.
         bucketed_grad_data = self._get(
             torch.Size([end_index - start_index]), start_index, buffer_type=BufferType.GRAD
         )
@@ -942,6 +1711,8 @@ class _ParamAndGradBuffer:
             numel_unpadded=numel_unpadded,
             gradient_scaling_factor=self.gradient_scaling_factor,
             bucket_id=bucket_id,
+            param_index_map=self.param_index_map,
+            params_with_extra_main_grads=bucket_params_with_extra_main_grads,
         )
         for bucket_param in bucket_params:
             assert bucket_param not in self.param_to_bucket
@@ -954,6 +1725,80 @@ class _ParamAndGradBuffer:
         Zero out the underlying grad_buffer.
         """
         self.grad_data.zero_()
+        for grad in self.extra_main_grads:
+            grad.zero_()
+
+    def get_nccl_mem_pools(self) -> set["torch.cuda.MemPool"]:
+        """Return this buffer's distinct live NCCL memory pools."""
+        return {pool for pool in (self.param_nccl_mem_pool, self.nccl_mem_pool) if pool is not None}
+
+    def _deregister_nccl_mem_pool_after_error(self, pool: "torch.cuda.MemPool") -> None:
+        """Best-effort rollback without replacing the error that triggered cleanup."""
+        try:
+            nccl_allocator.deregister_mem_pool(pool, self.data_parallel_group)
+        except RuntimeError:
+            pass
+
+    def _register_nccl_mem_pool(self, pool: "torch.cuda.MemPool") -> None:
+        """Register a pool and roll back partial ProcessGroupNCCL bookkeeping on failure."""
+        try:
+            nccl_allocator.register_mem_pool(
+                pool,
+                self.data_parallel_group,
+                symmetric=not self.ddp_config.disable_symmetric_registration,
+            )
+        except RuntimeError as error:
+            # ProcessGroupNCCL records the pool before registering its existing segments. If a
+            # segment fails, removing that record must precede releasing the pool allocation.
+            self._deregister_nccl_mem_pool_after_error(pool)
+            error.add_note("Failed to register NCCL memory pool.")
+            raise
+
+    def deregister_nccl_mem_pools(self) -> None:
+        """Deregister every live NCCL memory pool owned by this buffer."""
+        for pool in self.get_nccl_mem_pools():
+            nccl_allocator.deregister_mem_pool(pool, self.data_parallel_group)
+
+    def deregister_grad_pool_for_offload(self) -> None:
+        """Deregister replaceable gradient storage before releasing it."""
+        if self.nccl_mem_pool is None:
+            return
+        if not self.nccl_grad_pool_is_separate:
+            raise RuntimeError(
+                "Gradient-buffer offload requires a separate NCCL gradient pool; construct "
+                "DistributedDataParallel with grad_buffer_offload=True."
+            )
+        nccl_allocator.deregister_mem_pool(self.nccl_mem_pool, self.data_parallel_group)
+
+    def release_offloaded_grad_pool(self) -> None:
+        """Drop the pool owner after its gradient storage has been released."""
+        if not self.nccl_grad_pool_is_separate:
+            return
+        assert self.grad_data.storage().size() == 0
+        self.nccl_mem_pool = None
+
+    def reload_grad_buffer_into_nccl_pool(self) -> None:
+        """Recreate, populate, and register offloaded gradient storage."""
+        assert self.nccl_grad_pool_is_separate
+        assert self.nccl_mem_pool is None
+        pool = nccl_allocator.create_nccl_mem_pool(
+            symmetric=not self.ddp_config.disable_symmetric_registration
+        )
+        try:
+            # nccl_mem suppresses registration RuntimeError, which could leave live replacement
+            # storage unregistered. Allocate in the pool first, then register explicitly.
+            with torch.cuda.use_mem_pool(pool):
+                self.reload_from_cpu(move_params=False, move_grads=True)
+            self._register_nccl_mem_pool(pool)
+        except RuntimeError as error:
+            # Leave the buffer offloaded so a caller can retry or shut down cleanly.
+            try:
+                self.offload_to_cpu(move_params=False, move_grads=True)
+            except RuntimeError:
+                pass
+            error.add_note("Failed to reload gradient buffer into NCCL memory pool.")
+            raise
+        self.nccl_mem_pool = pool
 
     def offload_to_cpu(self, move_params: bool = True, move_grads: bool = True) -> None:
         """
@@ -989,7 +1834,9 @@ class _ParamAndGradBuffer:
 
 
 def partition_buckets(
-    buffers: List[_ParamAndGradBuffer], force_single_bucket_group: bool = False
+    buffers: List[_ParamAndGradBuffer],
+    force_single_bucket_group: bool = False,
+    reduce_scatter_with_fp32_accumulation: bool = False,
 ) -> List[_ParamAndGradBucketGroup]:
     """
     Automatically regroup the buckets of input buffers and return a list of bucket groups.
@@ -1003,7 +1850,11 @@ def partition_buckets(
     CUDA_DEVICE_MAX_CONNECTIONS=1, having multiple back-to-back communications will prevent the
     overlap of communication kernels with computation kernels.
 
-    The grouping strategy is:
+    Before applying a grouping strategy that could merge buckets, buffers are partitioned by
+    optimizer ownership so a bucket group never mixes LayerWise-managed and
+    DistributedOptimizer-managed parameters.
+
+    The grouping strategy within each optimizer ownership partition is:
     1. If force_single_bucket_group is True, put all buckets across all buffers into a single
        bucket group.
     2. If force_single_bucket_group is False, when there is no fp8 buffer in the input buffers,
@@ -1022,19 +1873,61 @@ def partition_buckets(
 
     Args:
         buffers (list): list of input buffers.
-        single_bucket_group_per_buffer (bool, optional): force group all buckets in each buffer
-            into a single bucket group.
+        force_single_bucket_group (bool, optional): force all buckets with the same optimizer
+            ownership into a single bucket group.
+        reduce_scatter_with_fp32_accumulation (bool, optional): keep buckets separate when the
+            FP32-accumulating reduce-scatter implementation requires singleton groups.
     """
 
     if len(buffers) == 0:
         return []
 
-    dtype_to_buffer_map = {}
+    # LayerWiseDistributedOptimizer and DistributedOptimizer classify a whole bucket group from
+    # its first bucket when synchronizing their subsets. Partition only when the policy below may
+    # merge owners (or when multiple owners each have an FP8 buffer); singleton paths retain their
+    # existing global bucket order for overlap linkage.
+    buffers_by_optimizer_owner = {}
+    num_fp8_buffers = 0
     for buffer in buffers:
-        dtype = buffer.param_dtype
-        # Make sure that the param_dtype of any two buffers is different.
-        assert dtype not in dtype_to_buffer_map
-        dtype_to_buffer_map[dtype] = buffer
+        assert buffer.params
+        is_layerwise_owned = getattr(buffer.params[0], 'is_managed_by_layer_wise_optimizer', False)
+        assert all(
+            getattr(param, 'is_managed_by_layer_wise_optimizer', False) == is_layerwise_owned
+            for param in buffer.params
+        )
+        buffers_by_optimizer_owner.setdefault(is_layerwise_owned, []).append(buffer)
+        num_fp8_buffers += int(buffer.param_dtype == torch.uint8)
+
+    should_partition_by_owner = len(buffers_by_optimizer_owner) > 1 and (
+        force_single_bucket_group
+        or num_fp8_buffers > 1
+        or (num_fp8_buffers == 1 and not reduce_scatter_with_fp32_accumulation)
+    )
+    if should_partition_by_owner:
+        owner_buffer_partitions = list(buffers_by_optimizer_owner.values())
+        owner_buffer_partitions.sort(
+            key=lambda owner_buffers: not any(
+                buffer.param_dtype == torch.uint8 for buffer in owner_buffers
+            )
+        )
+        return [
+            bucket_group
+            for owner_buffers in owner_buffer_partitions
+            for bucket_group in partition_buckets(
+                owner_buffers,
+                force_single_bucket_group=force_single_bucket_group,
+                reduce_scatter_with_fp32_accumulation=reduce_scatter_with_fp32_accumulation,
+            )
+        ]
+
+    # At most one fp8 (uint8) buffer is allowed; Cases 2 and 3 below branch on
+    # whether one is present. Non-uint8 dtypes can legitimately appear in
+    # multiple buffers, so the uniqueness check is restricted to uint8.
+    fp8_buffer = None
+    for buffer in buffers:
+        if buffer.param_dtype == torch.uint8:
+            assert fp8_buffer is None
+            fp8_buffer = buffer
 
     # Case 1: Put all buckets into a single bucket group if force_single_bucket_group is True.
     if force_single_bucket_group:
@@ -1053,7 +1946,7 @@ def partition_buckets(
         )
         return [bucket_group]
 
-    if torch.uint8 not in dtype_to_buffer_map:
+    if fp8_buffer is None:
         # Case 2: When there is no fp8 buffer in the input buffers, let each bucket group have
         #         only one bucket.
         bucket_groups = []
@@ -1077,11 +1970,36 @@ def partition_buckets(
                     non_fp8_buckets.append(bucket)
 
         bucket_groups = []
-        fp8_buffer = dtype_to_buffer_map[torch.uint8]
         for bucket in fp8_buffer.buckets:
             if len(bucket_groups) == len(fp8_buffer.buckets) - 1:
-                # The last bucket group.
-                group_buckets = [bucket] + non_fp8_buckets
+                # reduce_scatter_with_fp32_accumulation requires exactly one bucket
+                # per group (see assert in _ParamAndGradBucketGroup.reduce_scatter).
+                # Without this flag the non-FP8 buckets would be merged into the last
+                # FP8 group, violating that constraint. So we split them out into
+                # their own individual groups instead.
+                if reduce_scatter_with_fp32_accumulation:
+                    bucket_groups.append(
+                        _ParamAndGradBucketGroup(
+                            [bucket],
+                            buffer.ddp_config,
+                            buffer.data_parallel_group,
+                            buffer.data_parallel_world_size,
+                        )
+                    )
+                    if non_fp8_buckets:
+                        for non_fp8_bucket in non_fp8_buckets:
+                            bucket_groups.append(
+                                _ParamAndGradBucketGroup(
+                                    [non_fp8_bucket],
+                                    buffer.ddp_config,
+                                    buffer.data_parallel_group,
+                                    buffer.data_parallel_world_size,
+                                )
+                            )
+
+                    continue  # Skip the default bucket group creation below
+                else:
+                    group_buckets = [bucket] + non_fp8_buckets
             else:
                 # The first N-1 bucket groups.
                 group_buckets = [bucket]

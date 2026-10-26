@@ -1,9 +1,13 @@
-# Copyright (c) 2022, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import torch
 
 from megatron.core.parallel_state import get_global_memory_buffer
-from megatron.core.utils import get_tensor_model_parallel_group_if_none, is_torch_min_version
+from megatron.core.utils import (
+    get_pg_size,
+    get_tensor_model_parallel_group_if_none,
+    is_torch_min_version,
+)
 
 from .utils import split_tensor_along_last_dim
 
@@ -28,7 +32,11 @@ def _reduce(input_, group):
         return input_
 
     # All-reduce.
-    torch.distributed.all_reduce(input_.contiguous(), group=group)
+    # Note: If input_ is contiguous, it is mutated in-place.
+    # If not, a new contiguous tensor is created and returned;
+    # callers must use the returned value to ensure the reduced result is captured.
+    input_ = input_.contiguous()
+    torch.distributed.all_reduce(input_, group=group)
 
     return input_
 
@@ -419,11 +427,12 @@ class _ReduceScatterToTensorParallelRegion(torch.autograd.Function):
 
 class _AllToAll(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, group, input, output_split_sizes, input_split_sizes):
+    def forward(ctx, group, input, output_split_sizes, input_split_sizes, use_nccl_stream=False):
         """Forward function."""
         ctx.group = group
         ctx.output_split_sizes = output_split_sizes
         ctx.input_split_sizes = input_split_sizes
+        ctx.use_nccl_stream = use_nccl_stream
 
         world_size = group.size()
         # Bypass the function if we are using only 1 GPU.
@@ -441,13 +450,24 @@ class _AllToAll(torch.autograd.Function):
                 dtype=input.dtype,
                 device=torch.cuda.current_device(),
             )
-        torch.distributed.all_to_all_single(
-            output,
-            input,
-            output_split_sizes=output_split_sizes,
-            input_split_sizes=input_split_sizes,
-            group=group,
-        )
+        if use_nccl_stream:
+            handle = torch.distributed.all_to_all_single(
+                output,
+                input,
+                output_split_sizes=output_split_sizes,
+                input_split_sizes=input_split_sizes,
+                group=group,
+                async_op=True,
+            )
+            handle.wait()
+        else:
+            torch.distributed.all_to_all_single(
+                output,
+                input,
+                output_split_sizes=output_split_sizes,
+                input_split_sizes=input_split_sizes,
+                group=group,
+            )
         return output
 
     @staticmethod
@@ -455,7 +475,14 @@ class _AllToAll(torch.autograd.Function):
         """Backward function."""
         return (
             None,
-            _AllToAll.apply(ctx.group, *grad_output, ctx.input_split_sizes, ctx.output_split_sizes),
+            _AllToAll.apply(
+                ctx.group,
+                *grad_output,
+                ctx.input_split_sizes,
+                ctx.output_split_sizes,
+                ctx.use_nccl_stream,
+            ),
+            None,
             None,
             None,
         )
@@ -487,6 +514,8 @@ def scatter_to_tensor_model_parallel_region(input_, group=None):
 def gather_from_tensor_model_parallel_region(input_, group=None):
     """Wrapper for autograd function: forward: AG, backward: split <last dim>"""
     group = get_tensor_model_parallel_group_if_none(group)
+    if get_pg_size(group) == 1:
+        return input_
     return _GatherFromModelParallelRegion.apply(input_, group)
 
 
@@ -532,10 +561,12 @@ def reduce_scatter_last_dim_to_tensor_parallel_region(input_, group=None):
     return _ReduceScatterToTensorParallelRegion.apply(input_, group)
 
 
-def all_to_all(group, input_, output_split_sizes_=None, input_split_sizes=None):
+def all_to_all(
+    group, input_, output_split_sizes_=None, input_split_sizes=None, use_nccl_stream=False
+):
     """Wrapper for autograd function"""
     assert group is not None, "group should not be None"
-    return _AllToAll.apply(group, input_, output_split_sizes_, input_split_sizes)
+    return _AllToAll.apply(group, input_, output_split_sizes_, input_split_sizes, use_nccl_stream)
 
 
 def all_to_all_sp2hp(input_, group=None):
@@ -594,3 +625,98 @@ def all_to_all_hp2sp(input_, group=None):
     )
     output = torch.cat(split_tensors, dim=-1)
     return output
+
+
+class _AsyncCollectiveHandle:
+    """Awaitable tensor result of an asynchronous collective."""
+
+    def __init__(self):
+        self.tensor = None
+        self.work = None
+        # Keep a temporary contiguous input alive until NCCL has consumed it.
+        self._input_buffer = None
+
+    def wait(self):
+        """Wait at the first consumer and return the collective output."""
+        if self.work is not None:
+            self.work.wait()
+            self.work = None
+            self._input_buffer = None
+        return self.tensor
+
+
+class _GatherFromSequenceParallelRegionAsync(torch.autograd.Function):
+    """Launch an equal-split first-dimension all-gather without waiting for it."""
+
+    @staticmethod
+    def forward(ctx, input_, group, tensor_parallel_output_grad, handle):
+        """Launch the forward all-gather and publish its work through ``handle``."""
+        ctx.tensor_parallel_output_grad = tensor_parallel_output_grad
+        ctx.group = group
+
+        dim_size = list(input_.size())
+        dim_size[0] *= group.size()
+        output = torch.empty(dim_size, dtype=input_.dtype, device=input_.device)
+        input_buffer = input_.contiguous()
+        handle._input_buffer = input_buffer
+        handle.work = dist_all_gather_func(output, input_buffer, group=group, async_op=True)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Preserve the synchronous gather's reduce-scatter backward semantics."""
+        if ctx.tensor_parallel_output_grad:
+            grad_input = _reduce_scatter_along_first_dim(grad_output, ctx.group)
+        else:
+            grad_input = _split_along_first_dim(grad_output, ctx.group)
+        return grad_input, None, None, None
+
+
+def async_gather_from_sequence_parallel_region(
+    input_, tensor_parallel_output_grad=True, group=None
+):
+    """Launch an equal-split AG and return a handle whose ``wait`` yields its tensor.
+
+    The caller must wait before the gathered tensor's first use. The returned
+    tensor retains the same autograd contract as
+    :func:`gather_from_sequence_parallel_region`: its backward either
+    reduce-scatters or splits along the first dimension.
+    """
+    if group is None:
+        raise ValueError("An explicit process group is required for asynchronous collectives.")
+    handle = _AsyncCollectiveHandle()
+    if group.size() == 1:
+        handle.tensor = input_
+        return handle
+    handle.tensor = _GatherFromSequenceParallelRegionAsync.apply(
+        input_, group, tensor_parallel_output_grad, handle
+    )
+    return handle
+
+
+def async_reduce_scatter_along_first_dim(input_, group=None):
+    """Launch an equal-split first-dimension reduce-scatter and return a handle.
+
+    This helper is intended for custom backward implementations that have
+    independent work to execute before the reduced local gradient is consumed.
+    The caller must invoke ``wait`` before using the returned tensor.
+    """
+    if group is None:
+        raise ValueError("An explicit process group is required for asynchronous collectives.")
+    handle = _AsyncCollectiveHandle()
+    if group.size() == 1:
+        handle.tensor = input_
+        return handle
+
+    dim_size = list(input_.size())
+    assert (
+        dim_size[0] % group.size() == 0
+    ), "First dimension of the tensor should be divisible by tensor parallel size"
+    dim_size[0] //= group.size()
+
+    handle.tensor = torch.empty(dim_size, dtype=input_.dtype, device=input_.device)
+    handle._input_buffer = input_.contiguous()
+    handle.work = dist_reduce_scatter_func(
+        handle.tensor, handle._input_buffer, group=group, async_op=True
+    )
+    return handle

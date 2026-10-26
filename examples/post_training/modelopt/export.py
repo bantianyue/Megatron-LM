@@ -2,6 +2,7 @@
 
 """Export a GPTModel."""
 import functools
+import inspect
 import os
 import sys
 import warnings
@@ -12,13 +13,15 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../../.
 import modelopt.torch.export as mtex
 import torch
 
+from megatron.core.utils import unwrap_model
 from megatron.post_training.arguments import add_modelopt_args
-from megatron.post_training.checkpointing import load_modelopt_checkpoint
-from megatron.post_training.model_builder import modelopt_gpt_mamba_builder
-from megatron.post_training.utils import modelopt_version_at_least
+from megatron.post_training.model_builder import modelopt_gpt_hybrid_builder
 from megatron.training import get_args, get_model
+from megatron.training.arguments import parse_and_validate_args
+from megatron.training.checkpointing import load_checkpoint
+from megatron.training.argument_utils import inference_cfg_container_from_args
+from megatron.training.global_vars import set_run_config
 from megatron.training.initialize import initialize_megatron
-from megatron.training.utils import unwrap_model
 from model_provider import model_provider
 
 warnings.filterwarnings('ignore')
@@ -37,13 +40,26 @@ def add_modelopt_export_args(parser):
         type=str,
         help="A pretrained model hosted inside a model repo on huggingface.co.",
     )
+    group.add_argument(
+        "--export-vllm-fq",
+        action="store_true",
+        default=False,
+        help="Export the model for vLLM fakequant reload.",
+    )
+    group.add_argument(
+        "--no-clamp-kv-scales",
+        action="store_false",
+        dest="clamp_kv_scales",
+        default=True,
+        help="Preserve FP8 KV-cache scales learned during QAT instead of clamping them to 1.0.",
+    )
     group.add_argument("--export-dir", type=str, help="The target export path.")
     add_modelopt_args(parser)
     return parser
 
 
 if __name__ == "__main__":
-    initialize_megatron(
+    args = parse_and_validate_args(
         extra_args_provider=add_modelopt_export_args,
         args_defaults={
             'tokenizer_type': 'HuggingFaceTokenizer',
@@ -51,6 +67,10 @@ if __name__ == "__main__":
             'no_load_optim': True,
         },
     )
+    # Temporary args/config duplication during the training-loop refactor:
+    # migrated settings use config; remaining settings still use legacy args.
+    set_run_config(inference_cfg_container_from_args(args, build_model_config=False))
+    initialize_megatron(training=False)
 
     args = get_args()
 
@@ -68,7 +88,7 @@ if __name__ == "__main__":
         )
 
     model = get_model(
-        functools.partial(model_provider, modelopt_gpt_mamba_builder), wrap_with_ddp=False
+        functools.partial(model_provider, modelopt_gpt_hybrid_builder), wrap_with_ddp=False
     )
 
     # Materialize the model from meta device to cpu before loading the checkpoint.
@@ -76,7 +96,7 @@ if __name__ == "__main__":
     unwrapped_model.to_empty(device="cpu")
 
     if args.load is not None and Path(args.load).is_dir():
-        _ = load_modelopt_checkpoint(model)
+        load_checkpoint(model, None, None)
     else:
         raise ValueError(f"Invalid load checkpoint directory: {args.load}")
 
@@ -96,6 +116,17 @@ if __name__ == "__main__":
         "export_dir": args.export_dir,
         "moe_router_dtype": unwrapped_model.config.moe_router_dtype,
     }
-    if modelopt_version_at_least("0.41.0"):
+    export_fn = mtex.export_mcore_gpt_to_hf_vllm_fq if args.export_vllm_fq else mtex.export_mcore_gpt_to_hf
+
+    if "trust_remote_code" in inspect.signature(export_fn).parameters:
         export_kwargs.update({"trust_remote_code": args.trust_remote_code})
-    mtex.export_mcore_gpt_to_hf(unwrapped_model, args.pretrained_model_name, **export_kwargs)
+
+    if "clamp_kv_cache_scales" in inspect.signature(export_fn).parameters:
+        export_kwargs["clamp_kv_cache_scales"] = args.clamp_kv_scales
+    elif not args.clamp_kv_scales:
+        raise RuntimeError(
+            "--no-clamp-kv-scales requires a ModelOpt version that supports "
+            "export_mcore_gpt_to_hf(..., clamp_kv_cache_scales=False)."
+        )
+
+    export_fn(unwrapped_model, args.pretrained_model_name, **export_kwargs)

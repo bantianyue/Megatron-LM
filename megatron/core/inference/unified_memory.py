@@ -69,6 +69,12 @@ def _compile_timeout(timeout_s: int):
             "Please clean up your stale cache and try again."
         )
 
+    # Signal-based timeout only works in the main thread.
+    # In non-main threads (e.g., Ray actors), skip the timeout mechanism.
+    if threading.current_thread() is not threading.main_thread():
+        yield
+        return
+
     curr_handler = signal.signal(signal.SIGALRM, _handler)
     try:
         signal.alarm(timeout_s)
@@ -271,6 +277,16 @@ def create_unified_mempool() -> "MemPool":
             + details
         )
     else:
+        # torch.cuda.MemPool can't coexist with expandable_segments; bail so the
+        # caller falls back to non-UVM allocation.
+        alloc_conf = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+        if "expandable_segments:true" in alloc_conf.lower():
+            raise UnifiedMemoryUnsupportedError(
+                "UVM mempool is incompatible with the expandable-segments allocator "
+                "(PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True, which "
+                "torch.cuda.MemPool does not support). Unset expandable_segments to "
+                "use UVM."
+            )
         return MemPool(allocator=_alloc)
 
 

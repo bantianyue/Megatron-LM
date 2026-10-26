@@ -43,7 +43,6 @@ MODEL_ARGS:
   --straggler-minmax-count: 16
   --tensorboard-log-interval: 1
   --empty-unused-memory-level: 2
-  --langrl-inference-server-type: inplace_megatron
   --seed: 42
   --calculate-per-token-loss: true
   --rl-use-sequence-packing: true
@@ -63,6 +62,7 @@ MODEL_ARGS:
   --grpo-entropy-term-weight: 0.0
   --langrl-env-config: tests/functional_tests/test_cases/gpt/gpt_grpo_tp1tp2_pp1_dp8_583m_throughputtest/env_config.yaml
   --rl-partial-rollouts: true
+  --rl-generation-lag: 0
   --lr: 0.000001
   --lr-warmup-samples: 0
   --clip-grad: 1.0
@@ -81,3 +81,4 @@ MODEL_ARGS:
 METRICS:
   - "mem-allocated-bytes"
   - "mem-max-allocated-bytes"
+LAUNCHER: ft_launcher

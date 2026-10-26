@@ -1,17 +1,31 @@
+<!---
+   Copyright (c) 2022-2026, NVIDIA CORPORATION. All rights reserved.
+   NVIDIA CORPORATION and its licensors retain all intellectual property
+   and proprietary rights in and to this software, related documentation
+   and any modifications thereto. Any use, reproduction, disclosure or
+   distribution of this software and related documentation without an express
+   license agreement from NVIDIA CORPORATION is strictly prohibited.
+-->
+
 # Advanced Features
 
-Advanced feature guides for key Megatron Core capabilities.
+Guides for Megatron Core training and inference features.
 
 ```{toctree}
 :maxdepth: 2
 
+cuda_graph
+fine_grained_activation_offloading
+low_precision_training
 moe
-context_parallel
-custom_fsdp
+megatron_fsdp
 dist_optimizer
+checkpoint-merge
 optimizer_cpu_offload
-pipeline_parallel_layout
+paged_stash
 tokenizers
 megatron_energon
 megatron_rl
+offline_logits_distillation
+../../mcore-inference-user-guide
 ```
